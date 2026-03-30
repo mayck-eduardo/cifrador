@@ -2,7 +2,6 @@
 
 import * as cheerio from 'cheerio';
 import { Document, Packer, Paragraph, TextRun, convertMillimetersToTwip } from 'docx';
-import PDFDocument from 'pdfkit';
 
 // -- TRANSPOSITION LOGIC --
 const scale = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
