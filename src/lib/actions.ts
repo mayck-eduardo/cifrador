@@ -36,11 +36,18 @@ function isChordToken(token: string) {
 }
 
 function isChordLine(line: string) {
-    let tokens = line.split(/\s+/).filter(Boolean);
+    let tokens = line.split(/[\s\t]+/).filter(Boolean);
     if (tokens.length === 0) return false;
+    
+    // Ignore lines that are clearly tab headers or contain mostly dashes
+    if (line.includes('|') || line.includes('---')) return false;
+    if (line.toLowerCase().includes('[tab')) return false;
+
     let chordTokens = tokens.filter(isChordToken);
-    let isMostlyChords = chordTokens.length / tokens.length > 0.6;
-    let containsLowerCase = /[a-z]{3,}/.test(line); 
+    if (chordTokens.length === 0) return false;
+
+    let isMostlyChords = chordTokens.length / tokens.length > 0.5;
+    let containsLowerCase = /[a-z]{3,}/.test(line.replace(/\[.*?\]/g, '')); 
     return isMostlyChords && !containsLowerCase;
 }
 
@@ -98,7 +105,7 @@ function cleanYoutubeTitle(title: string) {
   for (const term of termsToRemove) {
     title = title.replace(new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '');
   }
-  return title.trim();
+  return title.replace(/[|:;\\\/_-]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 export type MusicQueryOptions = {
@@ -106,6 +113,8 @@ export type MusicQueryOptions = {
     transposeBy?: number; 
     pageSize?: 'DESKTOP' | 'MOBILE';
     formats?: string[]; // e.g., ['docx', 'pdf']
+    removeTabs?: boolean;
+    simplified?: boolean;
     colors?: {
         title: string;
         lyrics: string;
@@ -116,12 +125,39 @@ export type MusicQueryOptions = {
     }
 };
 
+async function fetchWithTimeout(url: string, options: any = {}, timeout = 25000) {
+  console.log(`[Cifrador] Fetching: ${url} (timeout: ${timeout}ms)`);
+  const controller = new AbortController();
+  const id = setTimeout(() => {
+    controller.abort();
+    console.log(`[Cifrador] Timeout reached for: ${url}`);
+  }, timeout);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(id);
+    return response;
+  } catch (err) {
+    clearTimeout(id);
+    throw err;
+  };
+}
+
+function isTabLine(line: string) {
+    const dashCount = (line.match(/-/g) || []).length;
+    const barCount = (line.match(/\|/g) || []).length;
+    const guitarNotation = (line.match(/^[abcdefg][#b]?\s*\|/i) || []).length;
+    return (dashCount > 6) || (barCount > 2 && dashCount > 2) || (guitarNotation >= 1);
+}
+
+
 export async function processMusicQuery(query: string, options?: MusicQueryOptions) {
   const opts = {
       fontFamily: options?.fontFamily || 'Courier New',
       transposeBy: options?.transposeBy || 0,
       pageSize: options?.pageSize || 'DESKTOP',
-      formats: options?.formats || ['docx'],
+      formats: options?.formats || ['docx', 'pdf'],
+      removeTabs: options?.removeTabs || false,
+      simplified: options?.simplified || false,
       colors: {
          title: (options?.colors?.title || '#2B6CB0').replace('#', ''),
          lyrics: (options?.colors?.lyrics || '#000000').replace('#', ''),
@@ -134,65 +170,180 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
 
   try {
     let searchTerm = query.trim();
+    console.log(`[Cifrador] Iniciando processamento para: "${searchTerm}"`);
+
     if (searchTerm.includes('youtube.com/') || searchTerm.includes('youtu.be/')) {
-      const ytRes = await fetch(searchTerm, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      console.log(`[Cifrador] Detectado link do YouTube, buscando título...`);
+      const ytRes = await fetchWithTimeout(searchTerm, { 
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' } 
+      });
       if (!ytRes.ok) throw new Error('Não foi possível acessar o YouTube.');
       const html = await ytRes.text();
       const $ = cheerio.load(html);
       searchTerm = cleanYoutubeTitle($('title').text() || '');
+      console.log(`[Cifrador] Título extraído do YouTube: "${searchTerm}"`);
     }
     
-    // Search
-    const searchUrl = 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(`site:cifraclub.com.br ${searchTerm}`);
-    const searchRes = await fetch(searchUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } });
-    if (!searchRes.ok) throw new Error('Falha ao buscar no DuckDuckGo.');
-    const searchHtml = await searchRes.text();
-    const $search = cheerio.load(searchHtml);
-    
+    const commonHeaders = { 
+      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache'
+    };
+
     let cifraUrl = '';
-    $search('.result__snippet').each((_, el) => {
-       const href = $search(el).parent().attr('href');
-       if (href) {
-         let decodedUrl = href;
-         if (href.includes('uddg=')) {
-            const urlParams = new URLSearchParams(href.split('?')[1]);
-            decodedUrl = decodeURIComponent(urlParams.get('uddg') || '');
-         }
-         if (decodedUrl.includes('cifraclub.com.br/') && !decodedUrl.includes('/letra/')) {
-           const urlObj = new URL(decodedUrl);
-           const paths = urlObj.pathname.split('/').filter(Boolean);
-           if (paths.length >= 2) {
-             cifraUrl = decodedUrl;
-             return false;
-           }
-         }
-       }
-    });
 
-    if (!cifraUrl) {
-       $search('.result__url').each((_, el) => {
-          const text = $search(el).text().trim();
-           if (text.includes('cifraclub.com.br/') && !text.includes('/letra/') && !text.includes('/academy/') && text.split('/').filter(Boolean).length >= 3) {
-             cifraUrl = 'https://' + text;
-             return false;
+    // Direct CifraClub link support
+    if (searchTerm.startsWith('http') && (searchTerm.includes('cifraclub.com.br/') || searchTerm.includes('cifras.com.br/'))) {
+        cifraUrl = searchTerm;
+        console.log(`[Cifrador] Usando link direto: ${cifraUrl}`);
+    } else {
+        // Search
+        console.log(`[Cifrador] Buscando cifra para: ${searchTerm}`);
+        // Usando DuckDuckGo LITE que é menos propenso a bloqueios de bot
+        let searchUrl = 'https://duckduckgo.com/lite/?q=' + encodeURIComponent(`${searchTerm} cifra`);
+        let searchRes = await fetchWithTimeout(searchUrl, { headers: commonHeaders });
+
+        if (!searchRes.ok) {
+            console.log(`[Cifrador] DuckDuckGo falhou (Status: ${searchRes.status}). Tentando Bing...`);
+            searchUrl = 'https://www.bing.com/search?q=' + encodeURIComponent(`${searchTerm} cifra`);
+            searchRes = await fetchWithTimeout(searchUrl, { headers: commonHeaders });
+        }
+
+        if (!searchRes.ok) throw new Error(`Falha na busca (Status: ${searchRes.status}). Tente novamente.`);
+        
+        const searchHtml = await searchRes.text();
+        const $search = cheerio.load(searchHtml);
+        
+        // Log para diagnóstico se não encontrar nada
+        const pageTitle = $search('title').text().trim();
+        if (pageTitle.toLowerCase().includes('pardon') || pageTitle.toLowerCase().includes('bloqueio') || pageTitle.toLowerCase().includes('security')) {
+            console.warn(`[Cifrador] Bloqueio detectado pelo buscador: "${pageTitle}"`);
+        }
+
+        // Selector universal: procura por QUALQUER link que contenha cifraclub ou cifras no href
+        $search('a').each((_, el) => {
+           let href = $search(el).attr('href');
+           if (!href) return;
+
+           let decodedUrl = href;
+           // Limpeza de redirecionamentos (DuckDuckGo, Bing, etc)
+           if (href.includes('uddg=')) {
+              const urlParams = new URLSearchParams(href.split('?')[1]);
+              decodedUrl = decodeURIComponent(urlParams.get('uddg') || '');
+           } else if (href.includes('r.search.yahoo.com') || href.includes('bing.com/ck/')) {
+              // Yahoo/Bing às vezes usam links complexos, mas a URL alvo costuma estar no href ou visível
            }
-       });
+
+           // Normaliza URL
+           if (decodedUrl.startsWith('//')) decodedUrl = 'https:' + decodedUrl;
+           if (!decodedUrl.startsWith('http') && (decodedUrl.includes('cifraclub.com.br') || decodedUrl.includes('cifras.com.br'))) {
+               decodedUrl = 'https://' + decodedUrl.replace(/^\/+/, '');
+           }
+
+           const isCifraClub = decodedUrl.includes('cifraclub.com.br/');
+           const isCifras = decodedUrl.includes('cifras.com.br/');
+
+           if ((isCifraClub || isCifras) && !decodedUrl.includes('/letra/') && !decodedUrl.includes('/musicos/') && !decodedUrl.includes('/academy/')) {
+               try {
+                   const urlObj = new URL(decodedUrl);
+                   const paths = urlObj.pathname.split('/').filter(Boolean);
+                   if (paths.length >= 1) {
+                       cifraUrl = urlObj.href;
+                       return false; // break loop
+                   }
+               } catch (e) { /* ignore invalid urls */ }
+           }
+        });
     }
 
-    if (!cifraUrl) throw new Error(`Não foi possível encontrar a cifra para: ${searchTerm}`);
+    if (!cifraUrl) throw new Error(`Não foi possível encontrar a cifra para: ${searchTerm}. Tente um nome mais simples.`);
+    
+    // Remove qualquer fragmento ou query param anterior antes de remontar
+    let cleanUrl = cifraUrl.split('#')[0].split('?')[0];
+    if (cleanUrl.endsWith('/')) {
+        // ok
+    } else if (!cleanUrl.endsWith('.html')) {
+        cleanUrl += '/';
+    }
+
+    // A lógica solicitada: usar o link que remove as tabs (#tabs=false)
+    if (opts.simplified && !cleanUrl.includes('simplificada.html')) {
+        cleanUrl = cleanUrl.replace(/\/$/, '') + '/simplificada.html';
+    }
+
+    const finalUrl = opts.removeTabs 
+        ? (cleanUrl.includes('?') ? `${cleanUrl}&tabs=false#tabs=false` : `${cleanUrl}?tabs=false#tabs=false`)
+        : cleanUrl;
+
+    console.log(`[Cifrador] URL final processada: ${finalUrl}`);
 
     // Fetch cipher
-    const cifraRes = await fetch(cifraUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    console.log(`[Cifrador] Baixando conteúdo da cifra...`);
+    const cifraRes = await fetchWithTimeout(finalUrl, { 
+      headers: { ...commonHeaders } 
+    });
+    if (!cifraRes.ok) throw new Error('Não foi possível acessar a página da cifra.');
     const cifraHtml = await cifraRes.text();
     const $cifra = cheerio.load(cifraHtml);
     
-    const rawCipher = $cifra('pre').text() || $cifra('.cifra_cnt').text() || '';
-    if (!rawCipher) throw new Error('Cifra não encontrada na página.');
+    // Seleção específica do bloco de cifra para evitar lixo de outras partes da página
+    let preElement = $cifra('pre.cifra_cnt');
+    if (preElement.length === 0) preElement = $cifra('#cifra_raw');
+    if (preElement.length === 0) preElement = $cifra('pre').first();
     
-    const songName = $cifra('h1.t1').text().trim() || searchTerm;
-    const artistName = $cifra('.t3').text().trim() || 'Artista Desconhecido';
+    let rawCipher = preElement.text() || $cifra('.cifra_cnt').text() || $cifra('.ct_cifra').text() || '';
+    if (!rawCipher) throw new Error('Conteúdo da cifra não encontrado na página.');
+    
+    // Limpeza profunda de tablaturas para simular o efeito do link #tabs=false
+    if (opts.removeTabs) {
+        console.log(`[Cifrador] Iniciando limpeza profunda de tablaturas...`);
+        let lines = rawCipher.split('\n');
+        
+        // 1. Limpeza cirúrgica de rótulos de Tab em linhas de acordes
+        let cleanedLines = lines.map(line => {
+            let l = line;
+            // Remove "[Tab - Intro]", "[Tab]", etc, mas mantém os acordes vizinhos
+            l = l.replace(/\[\s*tab.*?\s*\]/gi, '');
+            // Remove chord names soltos que costumam vir após o rótulo de Tab
+            // ex: "[Tab - Intro] C7M" -> remove o C7M extra se estiver no fim
+            l = l.replace(/\s+[A-G][b#]?(?:m|M|sus|add|maj|min|dim|aug)?\d*$/g, '');
+            return l;
+        });
 
-    const rawLines = rawCipher.split('\n');
+        // 2. Filtro agressivo de linhas de tablatura
+        rawCipher = cleanedLines.filter(line => {
+            const l = line.trim();
+            if (!l) return true; // Mantém linhas vazias para estrutura
+            
+            // Se for identificado como linha de tab (mais de 4 hifens ou barras verticais)
+            const hyphenCount = (l.match(/-/g) || []).length;
+            const barCount = (l.match(/\|/g) || []).length;
+            if (barCount >= 1 && (hyphenCount > 3 || l.includes('|'))) return false;
+            
+            // Utilitário isTabLine mais abrangente
+            if (isTabLine(l)) return false;
+            
+            // Setas de batida v v v ou ^ ^
+            if (/^[v\^\>\s\d\.\~\/\|]+$/.test(l) && (l.includes('v') || l.includes('^')) && l.length > 1) return false;
+            
+            // Resíduos de "Parte X de Y" ou "Solo:" se seguidos de vazio
+            if (/^Parte\s+\d+\s+de\s+\d+$/i.test(l)) return false;
+            if (/^Solo:?\s*$/i.test(l)) return false;
+            if (/^Dedilhado:?\s*$/i.test(l)) return false;
+            
+            return true;
+        }).join('\n');
+        
+        // Remove blocos de linhas vazias excessivas que sobram da remoção
+        rawCipher = rawCipher.replace(/\n\s*\n\s*\n/g, '\n\n');
+    }
+
+    const songName = $cifra('h1').first().text().trim() || searchTerm;
+    const artistName = $cifra('.t3').text().trim() || $cifra('h2').first().text().trim() || 'Artista Desconhecido';
+
+    let rawLines = rawCipher.split('\n');
     
     let pageWidthMM = opts.pageSize === 'MOBILE' ? 100 : 210;
     
@@ -270,6 +421,7 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
     let pdfBase64 = null;
 
     if (opts.formats.includes('docx')) {
+        console.log(`[Cifrador] Gerando DOCX...`);
         const paragraphElements = structuredParagraphs.map(pRuns => {
            if (pRuns.length === 0) return new Paragraph({ children: [] });
            
@@ -323,6 +475,7 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
     }
 
     if (opts.formats.includes('pdf')) {
+        console.log(`[Cifrador] Gerando PDF...`);
         const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
         
         function hexToRgbPdf(hexColor: string) {
@@ -372,10 +525,14 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
             }
 
             let currentX = mLeft;
-            for (let i = 0; i < pRuns.length; i++) {
+          for (let i = 0; i < pRuns.length; i++) {
                let r = pRuns[i];
                let textFont = r.bold ? courierBold : courier;
-               let cleanText = r.text.replace(/\r/g, '');
+                // PDF-Lib standard fonts support WinAnsi (Portuguese accents)
+                let cleanText = r.text.replace(/\r/g, '')
+                                    .replace(/↓/g, 'v')
+                                    .replace(/↑/g, '^')
+                                    .replace(/[^\x00-\xFF]/g, ' '); // Keep Latin-1 characters (accents), remove others
                let textWidth = textFont.widthOfTextAtSize(cleanText, finalFontSizePt);
                
                let textColor = hexToRgbPdf(r.color);
@@ -408,15 +565,17 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
         pdfBase64 = await pdfDoc.saveAsBase64();
     }
 
+    const finalFilename = `${artistName} - ${songName}`;
+    console.log(`[Cifrador] Sucesso: ${finalFilename}`);
     return {
       success: true,
       data: docxBase64,
       pdfData: pdfBase64,
-      filename: `${artistName} - ${songName}`
+      filename: finalFilename
     };
 
   } catch (error: any) {
-    console.error(error);
+    console.error(`[Cifrador] ERRO:`, error);
     return { success: false, error: error.message || 'Ocorreu um erro desconhecido.' };
   }
 }

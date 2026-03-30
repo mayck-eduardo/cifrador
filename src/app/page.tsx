@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Search, Link, Music, Download, FileText, Loader2, Settings, Plus, Minus, Smartphone, Monitor, Check } from 'lucide-react';
+import { Search, Link, Music, Download, FileText, Loader2, Settings, Plus, Minus, Smartphone, Monitor, Check, Scissors, AlertCircle, Info } from 'lucide-react';
 import { processMusicQuery, MusicQueryOptions } from '@/lib/actions';
 
 export default function Home() {
@@ -17,6 +17,8 @@ export default function Home() {
   const [pageSize, setPageSize] = useState<'DESKTOP' | 'MOBILE'>('DESKTOP');
   const [transposeBy, setTransposeBy] = useState(0);
   const [formats, setFormats] = useState<string[]>(['docx', 'pdf']);
+  const [removeTabs, setRemoveTabs] = useState(false);
+  const [simplified, setSimplified] = useState(false);
 
   const [colors, setColors] = useState({
     title: '#2B6CB0',
@@ -50,7 +52,9 @@ export default function Home() {
       pageSize,
       transposeBy,
       colors,
-      formats
+      formats,
+      removeTabs,
+      simplified
     };
 
     const res = await processMusicQuery(query, options);
@@ -282,6 +286,57 @@ export default function Home() {
                           <button type="button" onClick={() => setTransposeBy(p => Math.min(12, p + 1))} className="px-6 py-3 text-slate-400 hover:text-white hover:bg-white/10 transition-colors"><Plus className="w-5 h-5" /></button>
                         </div>
                       </div>
+
+                      <div className="flex flex-col gap-3 md:col-span-1">
+                        <label className="text-sm text-slate-400 font-medium tracking-wide flex items-center gap-2">
+                          Limpeza Especial <Scissors className="w-3 h-3 opacity-50" />
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() => setRemoveTabs(!removeTabs)}
+                          className={`group flex items-center justify-between p-4 rounded-2xl border transition-all duration-300 ${removeTabs ? 'bg-indigo-500/10 border-indigo-500/40 text-white shadow-[0_0_15px_rgba(99,102,241,0.1)]' : 'bg-black/40 border-white/5 text-slate-400 hover:border-white/20 hover:bg-white/5'}`}
+                        >
+                          <div className="flex flex-col items-start gap-1">
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-bold">Ocultar Tabs</span>
+                              <span className="flex items-center gap-1 px-1.5 py-0.5 bg-amber-500/10 text-amber-500 text-[9px] font-black rounded border border-amber-500/20 uppercase tracking-tighter">
+                                <AlertCircle className="w-2.5 h-2.5" /> Exp.
+                              </span>
+                            </div>
+                            <span className="text-[11px] opacity-60 leading-tight text-left">Remove tablaturas via limpeza algorítmica.</span>
+                          </div>
+                          <div className={`w-10 h-5 rounded-full relative transition-all duration-500 ${removeTabs ? 'bg-indigo-500 shadow-[0_0_10px_rgba(99,102,241,0.5)]' : 'bg-white/10'}`}>
+                            <motion.div 
+                              animate={{ x: removeTabs ? 22 : 2 }}
+                              className="absolute top-1 w-3 h-3 bg-white rounded-full shadow-sm"
+                            />
+                          </div>
+                        </button>
+                      </div>
+
+                      <div className="flex flex-col gap-3 md:col-span-1">
+                        <label className="text-sm text-slate-400 font-medium tracking-wide flex items-center gap-2">
+                          Variação <Music className="w-3 h-3 opacity-50" />
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() => setSimplified(!simplified)}
+                          className={`group flex items-center justify-between p-4 rounded-2xl border transition-all duration-300 ${simplified ? 'bg-fuchsia-500/10 border-fuchsia-500/40 text-white shadow-[0_0_15px_rgba(217,70,239,0.1)]' : 'bg-black/40 border-white/5 text-slate-400 hover:border-white/20 hover:bg-white/5'}`}
+                        >
+                          <div className="flex flex-col items-start gap-1">
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-bold">Versão Simplificada</span>
+                            </div>
+                            <span className="text-[11px] opacity-60 leading-tight text-left">Acordes básicos (ideal para iniciantes).</span>
+                          </div>
+                          <div className={`w-10 h-5 rounded-full relative transition-all duration-500 ${simplified ? 'bg-fuchsia-500 shadow-[0_0_10px_rgba(217,70,239,0.5)]' : 'bg-white/10'}`}>
+                            <motion.div 
+                              animate={{ x: simplified ? 22 : 2 }}
+                              className="absolute top-1 w-3 h-3 bg-white rounded-full shadow-sm"
+                            />
+                          </div>
+                        </button>
+                      </div>
                     </div>
                   </motion.div>
                 )}
@@ -292,7 +347,7 @@ export default function Home() {
               whileHover={{ scale: 1.02, y: -2 }}
               whileTap={{ scale: 0.98 }}
               type="submit"
-              disabled={loading || !query.trim()}
+              disabled={!!loading || !query.trim()}
               className="w-full bg-gradient-to-r from-indigo-600 to-fuchsia-600 hover:from-indigo-500 hover:to-fuchsia-500 text-white rounded-2xl py-4 flex items-center justify-center space-x-3 font-semibold text-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-[0_0_30px_-10px_rgba(217,70,239,0.5)]"
             >
               {loading ? (
