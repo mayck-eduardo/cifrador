@@ -199,66 +199,94 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
         cifraUrl = searchTerm;
         console.log(`[Cifrador] Usando link direto: ${cifraUrl}`);
     } else {
-        // Search
-        console.log(`[Cifrador] Buscando cifra para: ${searchTerm}`);
-        // Usando DuckDuckGo LITE que é menos propenso a bloqueios de bot
-        let searchUrl = 'https://duckduckgo.com/lite/?q=' + encodeURIComponent(`${searchTerm} cifra`);
-        let searchRes = await fetchWithTimeout(searchUrl, { headers: commonHeaders });
-
-        if (!searchRes.ok) {
-            console.log(`[Cifrador] DuckDuckGo falhou (Status: ${searchRes.status}). Tentando Bing...`);
-            searchUrl = 'https://www.bing.com/search?q=' + encodeURIComponent(`${searchTerm} cifra`);
-            searchRes = await fetchWithTimeout(searchUrl, { headers: commonHeaders });
+        // Busca usando a API Solr do CifraClub (funciona em ambientes serverless sem bloqueio)
+        console.log(`[Cifrador] Buscando cifra via API CifraClub para: ${searchTerm}`);
+        
+        try {
+            const solrUrl = `https://solr.sscdn.co/cc/c7/?q=${encodeURIComponent(searchTerm)}&rows=15`;
+            const solrRes = await fetchWithTimeout(solrUrl, { 
+                headers: { 
+                    'Accept': 'application/json',
+                    'Origin': 'https://www.cifraclub.com.br',
+                    'Referer': 'https://www.cifraclub.com.br/'
+                } 
+            }, 15000);
+            
+            if (solrRes.ok) {
+                const solrData = await solrRes.json();
+                const docs = solrData?.response?.docs || [];
+                
+                // Procura o primeiro resultado do tipo "2" (música) que tenha url
+                const songResult = docs.find((doc: any) => doc.tipo === '2' && doc.dns && doc.url);
+                
+                if (songResult) {
+                    cifraUrl = `https://www.cifraclub.com.br/${songResult.dns}/${songResult.url}/`;
+                    console.log(`[Cifrador] Encontrado via API Solr: ${songResult.txt} - ${songResult.art} => ${cifraUrl}`);
+                } else {
+                    // Se não encontrou música direta, tenta com resultado de artista
+                    const artistResult = docs.find((doc: any) => doc.tipo === '1' && doc.dns);
+                    if (artistResult) {
+                        console.log(`[Cifrador] Artista encontrado: ${artistResult.txt}. Buscando música no perfil...`);
+                        // Tenta buscar novamente com query mais específica
+                        const retryQuery = searchTerm.replace(new RegExp(artistResult.txt, 'gi'), '').trim();
+                        if (retryQuery) {
+                            const retryUrl = `https://solr.sscdn.co/cc/c7/?q=${encodeURIComponent(retryQuery + ' ' + artistResult.txt)}&rows=10`;
+                            const retryRes = await fetchWithTimeout(retryUrl, { headers: { 'Accept': 'application/json' } }, 10000);
+                            if (retryRes.ok) {
+                                const retryData = await retryRes.json();
+                                const retrySong = retryData?.response?.docs?.find((doc: any) => doc.tipo === '2' && doc.dns && doc.url);
+                                if (retrySong) {
+                                    cifraUrl = `https://www.cifraclub.com.br/${retrySong.dns}/${retrySong.url}/`;
+                                    console.log(`[Cifrador] Encontrado na retry: ${retrySong.txt} => ${cifraUrl}`);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                console.log(`[Cifrador] API Solr falhou (Status: ${solrRes.status})`);
+            }
+        } catch (solrErr: any) {
+            console.log(`[Cifrador] Erro na API Solr: ${solrErr.message}. Tentando fallback...`);
         }
 
-        if (!searchRes.ok) throw new Error(`Falha na busca (Status: ${searchRes.status}). Tente novamente.`);
-        
-        const searchHtml = await searchRes.text();
-        const $search = cheerio.load(searchHtml);
-        
-        // Log para diagnóstico se não encontrar nada
-        const pageTitle = $search('title').text().trim();
-        if (pageTitle.toLowerCase().includes('pardon') || pageTitle.toLowerCase().includes('bloqueio') || pageTitle.toLowerCase().includes('security')) {
-            console.warn(`[Cifrador] Bloqueio detectado pelo buscador: "${pageTitle}"`);
+        // Fallback: busca via Google (mais resiliente que DuckDuckGo/Bing em serverless)
+        if (!cifraUrl) {
+            console.log(`[Cifrador] Tentando fallback via Google...`);
+            try {
+                const googleUrl = 'https://www.google.com/search?q=' + encodeURIComponent(`${searchTerm} cifra site:cifraclub.com.br`);
+                const googleRes = await fetchWithTimeout(googleUrl, { headers: commonHeaders }, 15000);
+                
+                if (googleRes.ok) {
+                    const googleHtml = await googleRes.text();
+                    const $google = cheerio.load(googleHtml);
+                    
+                    $google('a').each((_, el) => {
+                        let href = $google(el).attr('href') || '';
+                        // Google wraps links in /url?q=...
+                        if (href.includes('/url?q=')) {
+                            const urlParams = new URLSearchParams(href.split('?')[1]);
+                            href = decodeURIComponent(urlParams.get('q') || '');
+                        }
+                        if (href.includes('cifraclub.com.br/') && !href.includes('/search') && !href.includes('/letra/') && !href.includes('/academy/')) {
+                            try {
+                                const urlObj = new URL(href);
+                                const paths = urlObj.pathname.split('/').filter(Boolean);
+                                if (paths.length >= 2) {
+                                    cifraUrl = urlObj.origin + urlObj.pathname;
+                                    return false;
+                                }
+                            } catch (e) { /* ignore */ }
+                        }
+                    });
+                }
+            } catch (googleErr: any) {
+                console.log(`[Cifrador] Google fallback falhou: ${googleErr.message}`);
+            }
         }
-
-        // Selector universal: procura por QUALQUER link que contenha cifraclub ou cifras no href
-        $search('a').each((_, el) => {
-           let href = $search(el).attr('href');
-           if (!href) return;
-
-           let decodedUrl = href;
-           // Limpeza de redirecionamentos (DuckDuckGo, Bing, etc)
-           if (href.includes('uddg=')) {
-              const urlParams = new URLSearchParams(href.split('?')[1]);
-              decodedUrl = decodeURIComponent(urlParams.get('uddg') || '');
-           } else if (href.includes('r.search.yahoo.com') || href.includes('bing.com/ck/')) {
-              // Yahoo/Bing às vezes usam links complexos, mas a URL alvo costuma estar no href ou visível
-           }
-
-           // Normaliza URL
-           if (decodedUrl.startsWith('//')) decodedUrl = 'https:' + decodedUrl;
-           if (!decodedUrl.startsWith('http') && (decodedUrl.includes('cifraclub.com.br') || decodedUrl.includes('cifras.com.br'))) {
-               decodedUrl = 'https://' + decodedUrl.replace(/^\/+/, '');
-           }
-
-           const isCifraClub = decodedUrl.includes('cifraclub.com.br/');
-           const isCifras = decodedUrl.includes('cifras.com.br/');
-
-           if ((isCifraClub || isCifras) && !decodedUrl.includes('/letra/') && !decodedUrl.includes('/musicos/') && !decodedUrl.includes('/academy/')) {
-               try {
-                   const urlObj = new URL(decodedUrl);
-                   const paths = urlObj.pathname.split('/').filter(Boolean);
-                   if (paths.length >= 1) {
-                       cifraUrl = urlObj.href;
-                       return false; // break loop
-                   }
-               } catch (e) { /* ignore invalid urls */ }
-           }
-        });
     }
 
-    if (!cifraUrl) throw new Error(`Não foi possível encontrar a cifra para: ${searchTerm}. Tente um nome mais simples.`);
+    if (!cifraUrl) throw new Error(`Não foi possível encontrar a cifra para: ${searchTerm}. Tente um nome mais específico (ex: "Lugar Secreto Gabriela Rocha").`);
     
     // Remove qualquer fragmento ou query param anterior antes de remontar
     let cleanUrl = cifraUrl.split('#')[0].split('?')[0];
@@ -292,6 +320,18 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
     let preElement = $cifra('pre.cifra_cnt');
     if (preElement.length === 0) preElement = $cifra('#cifra_raw');
     if (preElement.length === 0) preElement = $cifra('pre').first();
+    
+    // Se removeTabs ativo, remove elementos de tablatura do DOM ANTES de extrair texto
+    // Isso replica exatamente o que o #tabs=false do CifraClub faz via JavaScript
+    if (opts.removeTabs) {
+        console.log(`[Cifrador] Removendo tablaturas via DOM (como #tabs=false)...`);
+        preElement.find('.tablatura').remove();
+        preElement.find('.tablatura-container').remove();
+        preElement.find('[data-tab]').remove();
+        preElement.find('span.tablatura').remove();
+        // Remove blocos de tab que usam classe 'tab' ou 'cifra_tab'
+        preElement.find('.tab, .cifra_tab, .tabInativa').remove();
+    }
     
     let rawCipher = preElement.text() || $cifra('.cifra_cnt').text() || $cifra('.ct_cifra').text() || '';
     if (!rawCipher) throw new Error('Conteúdo da cifra não encontrado na página.');
