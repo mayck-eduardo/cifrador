@@ -60,7 +60,11 @@ function transposeLinePreservingSpacing(line: string, steps: number) {
 
     while ((match = regex.exec(line)) !== null) {
         let original = match[0];
-        if (isChordToken(original)) {
+        // Check that the character immediately after the match is NOT a letter/digit
+        // This prevents matching "F" inside "Faz" or "G" inside "Go" etc.
+        const charAfter = line[match.index + original.length];
+        const isPartOfWord = charAfter !== undefined && /[a-zA-Záéíóúàãõâêôüç]/.test(charAfter);
+        if (isChordToken(original) && !isPartOfWord) {
             let start = match.index;
             result += line.substring(lastIndex, start);
             let transposed = transposeChord(original, steps);
