@@ -403,9 +403,12 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
     // Process lengths
     let maxLineLength = 0;
     const processedLines = rawLines.map(line => {
-        let transposed = transposeLinePreservingSpacing(line, opts.transposeBy);
+        const isChord = isChordLine(line);
+        // Only transpose actual chord lines — lyric lines must never be modified
+        // This prevents words like "E", "Am", "Belo" in lyrics from being transposed
+        let transposed = isChord ? transposeLinePreservingSpacing(line, opts.transposeBy) : line;
         if (transposed.length > maxLineLength) maxLineLength = transposed.length;
-        return { original: line, text: transposed, isChord: isChordLine(line) };
+        return { original: line, text: transposed, isChord };
     });
 
     let requiredFontSizePt = printableWidthPt / (Math.max(maxLineLength, 1) * 0.65);
