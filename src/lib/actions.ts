@@ -2,6 +2,8 @@
 
 import * as cheerio from 'cheerio';
 import { Document, Packer, Paragraph, TextRun, convertMillimetersToTwip } from 'docx';
+import * as fs from 'fs';
+import * as path from 'path';
 
 // -- TRANSPOSITION LOGIC --
 const scale = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -467,6 +469,15 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
     let docxBase64 = null;
     let pdfBase64 = null;
 
+    // Sanitize filename for safe filesystem usage
+    const sanitizeFilename = (name: string) =>
+        name.replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, ' ').trim();
+
+    const layoutLabel = opts.pageSize === 'MOBILE' ? '[Mobile]' : '[Desktop]';
+    const baseFilename = sanitizeFilename(`${artistName} - ${songName} ${layoutLabel}`);
+    const downloadsDir = path.join(process.cwd(), 'downloads');
+    if (!fs.existsSync(downloadsDir)) fs.mkdirSync(downloadsDir, { recursive: true });
+
     if (opts.formats.includes('docx')) {
         console.log(`[Cifrador] Gerando DOCX...`);
         const paragraphElements = structuredParagraphs.map(pRuns => {
@@ -519,6 +530,11 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
 
         const buffer = await Packer.toBuffer(doc);
         docxBase64 = buffer.toString('base64');
+
+        // Save to /downloads folder on disk
+        const docxPath = path.join(downloadsDir, `${baseFilename}.docx`);
+        fs.writeFileSync(docxPath, buffer);
+        console.log(`[Cifrador] DOCX salvo em: ${docxPath}`);
     }
 
     if (opts.formats.includes('pdf')) {
@@ -610,6 +626,12 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
         });
 
         pdfBase64 = await pdfDoc.saveAsBase64();
+
+        // Save to /downloads folder on disk
+        const pdfBytes = await pdfDoc.save();
+        const pdfPath = path.join(downloadsDir, `${baseFilename}.pdf`);
+        fs.writeFileSync(pdfPath, pdfBytes);
+        console.log(`[Cifrador] PDF salvo em: ${pdfPath}`);
     }
 
     const finalFilename = `${artistName} - ${songName}`;
