@@ -2,8 +2,6 @@
 
 import * as cheerio from 'cheerio';
 import { Document, Packer, Paragraph, TextRun, convertMillimetersToTwip } from 'docx';
-import * as fs from 'fs';
-import * as path from 'path';
 
 // -- HARMONIC ENGINE --
 const scale = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -789,18 +787,6 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
     let docxBase64 = null;
     let pdfBase64 = null;
 
-    // Sanitize filename for safe filesystem usage
-    const sanitizeFilename = (name: string) =>
-        name.replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, ' ').trim();
-
-    const layoutLabel = opts.pageSize === 'MOBILE' ? '[Mobile]' : '[Desktop]';
-    const baseFilename = sanitizeFilename(`${artistName} - ${songName} ${layoutLabel}`);
-    // Use /tmp in serverless (Vercel/Lambda) or ./downloads locally
-    const downloadsDir = process.env.VERCEL
-        ? '/tmp/downloads'
-        : path.join(process.cwd(), 'downloads');
-    try { if (!fs.existsSync(downloadsDir)) fs.mkdirSync(downloadsDir, { recursive: true }); } catch {};
-
     if (opts.formats.includes('docx')) {
         console.log(`[Cifrador] Gerando DOCX...`);
         const paragraphElements = structuredParagraphs.map(pRuns => {
@@ -854,13 +840,6 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
 
         const buffer = await Packer.toBuffer(doc);
         docxBase64 = buffer.toString('base64');
-
-        // Save to disk (best-effort, works locally and on Vercel via /tmp)
-        try {
-            const docxPath = path.join(downloadsDir, `${baseFilename}.docx`);
-            fs.writeFileSync(docxPath, buffer);
-            console.log(`[Cifrador] DOCX salvo em: ${docxPath}`);
-        } catch { console.warn('[Cifrador] Não foi possível salvar DOCX no disco'); }
     }
 
     if (opts.formats.includes('pdf')) {
@@ -958,14 +937,6 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
         });
 
         pdfBase64 = await pdfDoc.saveAsBase64();
-
-        // Save to disk (best-effort)
-        try {
-            const pdfBytes = await pdfDoc.save();
-            const pdfPath = path.join(downloadsDir, `${baseFilename}.pdf`);
-            fs.writeFileSync(pdfPath, pdfBytes);
-            console.log(`[Cifrador] PDF salvo em: ${pdfPath}`);
-        } catch { console.warn('[Cifrador] Não foi possível salvar PDF no disco'); }
     }
 
     const finalFilename = `${artistName} - ${songName}`;
