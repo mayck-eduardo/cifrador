@@ -5,29 +5,213 @@ import { Document, Packer, Paragraph, TextRun, convertMillimetersToTwip } from '
 import * as fs from 'fs';
 import * as path from 'path';
 
-// -- TRANSPOSITION LOGIC --
+// -- HARMONIC ENGINE --
 const scale = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const scaleBemol = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
 
-function transposeNote(note: string, steps: number) {
-    if (!note) return "";
-    let isBemol = note.includes("b");
-    let index = isBemol ? scaleBemol.indexOf(note) : scale.indexOf(note);
-    if (index === -1) return note;
-    let newIndex = (index + steps) % 12;
-    if (newIndex < 0) newIndex += 12;
-    return scale[newIndex];
+// Circle of fifths — keys that prefer flats
+const flatKeys = new Set([5, 10, 3, 8, 1, 6]); // F, Bb, Eb, Ab, Db, Gb
+
+function noteIndex(note: string): number {
+    const idx = scale.indexOf(note);
+    if (idx !== -1) return idx;
+    return scaleBemol.indexOf(note);
 }
 
-function transposeChord(chordText: string, steps: number): string {
+function resolveEnharmonic(index: number, preferFlats: boolean): string {
+    return preferFlats ? scaleBemol[index] : scale[index];
+}
+
+function detectKeyPreference(roots: string[]): boolean {
+    if (roots.length === 0) return false;
+    let flatScore = 0;
+    let sharpScore = 0;
+    for (const root of roots) {
+        const idx = noteIndex(root);
+        if (idx === -1) continue;
+        if (flatKeys.has(idx)) flatScore++;
+        else if (!idx || idx === 2 || idx === 4 || idx === 7 || idx === 9 || idx === 11) sharpScore++;
+    }
+    return flatScore > sharpScore;
+}
+
+function transposeNote(note: string, steps: number, preferFlats?: boolean) {
+    if (!note || steps === 0) return note;
+    const idx = noteIndex(note);
+    if (idx === -1) return note;
+    const newIndex = ((idx + steps) % 12 + 12) % 12;
+    if (preferFlats !== undefined) return resolveEnharmonic(newIndex, preferFlats);
+    const wasFlat = note.includes('b');
+    return resolveEnharmonic(newIndex, wasFlat);
+}
+
+function transposeChord(chordText: string, steps: number, preferFlats?: boolean): string {
     if (steps === 0) return chordText;
     if (chordText.includes('/')) {
-        let parts = chordText.split('/');
-        return transposeChord(parts[0], steps) + '/' + transposeChord(parts[1], steps);
+        const parts = chordText.split('/');
+        return transposeChord(parts[0], steps, preferFlats) + '/' + transposeChord(parts[1], steps, preferFlats);
     }
     const match = chordText.match(/^([A-G][b#]?)(.*)$/);
     if (!match) return chordText;
-    return transposeNote(match[1], steps) + match[2];
+    return transposeNote(match[1], steps, preferFlats) + match[2];
+}
+
+// Capo math: C = (T - S + 12) % 12  → find capo from real key & shape
+//             T = (S + C) % 12       → find real key from shape & capo
+function capoTranspose(rootIndex: number, capoPosition: number): number {
+    return ((rootIndex - capoPosition) % 12 + 12) % 12;
+}
+
+function capoInfo(originalRoots: number[], capoPosition: number) {
+    const realKey = originalRoots[0];
+    const shapeKey = capoTranspose(realKey, capoPosition);
+    return { realKey, shapeKey, capoPosition };
+}
+
+const scaleDegrees = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII'];
+
+function keyDegrees(keyRoot: string, isMinor: boolean): string[] {
+    const idx = noteIndex(keyRoot);
+    if (idx === -1) return scaleDegrees;
+    if (isMinor) {
+        // Natural minor: i ii° III iv v VI VII
+        const intervals = [0, 2, 3, 5, 7, 8, 10];
+        return intervals.map(iv => {
+            const note = resolveEnharmonic((idx + iv) % 12, false);
+            const deg = scaleDegrees[iv];
+            if (iv === 0) return note + 'm (' + deg.toLowerCase() + ')';
+            if (iv === 2) return note + ' (' + deg + ')';
+            if (iv === 3) return note + 'm (iv)';
+            if (iv === 4) return note + 'm (v)';
+            if (iv === 5) return note + ' (' + deg + ')';
+            if (iv === 6) return note + ' (' + deg + ')';
+            return note;
+        });
+    }
+    // Major: I ii iii IV V vi vii°
+    const intervals = [0, 2, 4, 5, 7, 9, 11];
+    return intervals.map(iv => {
+        const note = resolveEnharmonic((idx + iv) % 12, false);
+        const deg = scaleDegrees[iv];
+        if (iv === 0) return note + ' (I)';
+        if (iv === 1) return note + 'm (ii)';
+        if (iv === 2) return note + 'm (iii)';
+        if (iv === 3) return note + ' (IV)';
+        if (iv === 4) return note + ' (V)';
+        if (iv === 5) return note + 'm (vi)';
+        if (iv === 6) return note + '° (vii°)';
+        return note;
+    });
+}
+
+function detectKeyFromChordTokens(tokens: string[], firstChord?: string, lastChord?: string): {
+    root: string; isMinor: boolean; confidence: number; candidates: { root: string; isMinor: boolean; score: number }[]
+} {
+    if (tokens.length === 0) return { root: 'C', isMinor: false, confidence: 0, candidates: [{ root: 'C', isMinor: false, score: 0 }] };
+
+    const rootFreq: Record<string, number> = {};
+    const rootMinorFreq: Record<string, number> = {};
+    let firstRoot = '';
+    let lastRoot = '';
+
+    for (let i = 0; i < tokens.length; i++) {
+        const t = tokens[i];
+        const m = t.match(/^([A-G][#b]?)(.*)$/);
+        if (!m) continue;
+        const root = m[1];
+        const quality = m[2] || '';
+        rootFreq[root] = (rootFreq[root] || 0) + 1;
+        if (quality.startsWith('m') && !quality.startsWith('M')) {
+            rootMinorFreq[root] = (rootMinorFreq[root] || 0) + 1;
+        }
+        if (i === 0) firstRoot = root;
+        lastRoot = root;
+    }
+
+    firstRoot = firstChord || firstRoot;
+    lastRoot = lastChord || lastRoot;
+    const totalCount = tokens.length;
+
+    // Score each possible key (12 major + 12 minor)
+    type Candidate = { root: string; isMinor: boolean; score: number };
+    const candidates: Candidate[] = [];
+
+    for (const isMinor of [false, true]) {
+        for (let keyIdx = 0; keyIdx < 12; keyIdx++) {
+            const keyRoot = resolveEnharmonic(keyIdx, false);
+            // Scale intervals for the key
+            const intervals = isMinor ? [0, 2, 3, 5, 7, 8, 10] : [0, 2, 4, 5, 7, 9, 11];
+            const scaleNotes = intervals.map(iv => (keyIdx + iv) % 12);
+
+            let score = 0;
+            // For each root in the song, check if it belongs to this key
+            for (const [root, count] of Object.entries(rootFreq)) {
+                const rootIdx = noteIndex(root);
+                if (rootIdx === -1) continue;
+                const weight = count / totalCount;
+
+                if (rootIdx === keyIdx) {
+                    // Tonic match
+                    const isTonicMinor = (rootMinorFreq[root] || 0) > count / 2;
+                    if (isMinor === isTonicMinor) score += 3 * weight;
+                    else score += 1.5 * weight;
+                } else if (rootIdx === (keyIdx + 7) % 12) {
+                    // Dominant (V) — very strong indicator
+                    score += 2 * weight;
+                } else if (rootIdx === (keyIdx + 5) % 12) {
+                    // Subdominant (IV)
+                    score += 1.5 * weight;
+                } else if (rootIdx === (keyIdx + 3) % 12) {
+                    // Relative minor/major
+                    score += 0.8 * weight;
+                } else if (isMinor && rootIdx === (keyIdx + 10) % 12) {
+                    // bVII in minor — common in rock/pop
+                    score += 0.6 * weight;
+                } else if (isMinor && rootIdx === (keyIdx + 8) % 12) {
+                    // VI in minor
+                    score += 0.5 * weight;
+                } else if (scaleNotes.includes(rootIdx)) {
+                    score += 0.3 * weight;
+                } else {
+                    score -= 0.5 * weight; // Penalty for out-of-key roots
+                }
+            }
+
+            // Bonus for first chord matching tonic
+            if (firstRoot) {
+                const fIdx = noteIndex(firstRoot);
+                if (fIdx === keyIdx) score += 1.2;
+                else if (fIdx === (keyIdx + 7) % 12) score += 0.5;
+            }
+            // Bonus for last chord matching tonic
+            if (lastRoot) {
+                const lIdx = noteIndex(lastRoot);
+                if (lIdx === keyIdx) score += 0.8;
+            }
+
+            candidates.push({ root: keyRoot, isMinor, score: Math.round(score * 100) / 100 });
+        }
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    const best = candidates[0];
+    const runnerUp = candidates[1];
+
+    // Normalize confidence
+    const maxPossible = Math.min(8, 3 + totalCount * 0.3);
+    const rawConfidence = best.score / maxPossible;
+    const confidence = Math.min(1, Math.max(0.1, rawConfidence));
+
+    // If top two are very close, lower confidence
+    const gap = best.score - runnerUp.score;
+    const finalConfidence = gap < 0.3 ? confidence * 0.6 : confidence;
+
+    return {
+        root: best.root,
+        isMinor: best.isMinor,
+        confidence: Math.round(finalConfidence * 100) / 100,
+        candidates: candidates.slice(0, 5)
+    };
 }
 
 const chordPattern = /([A-G][b#]?(?:m|M|sus|add|maj|min|dim|aug)?\d*(?:m|M|sus|add|maj|min|dim|aug)?(?:\([^)]+\))?(?:\/[A-G][b#]?)?)/g;
@@ -53,8 +237,8 @@ function isChordLine(line: string) {
     return isMostlyChords && !containsLowerCase;
 }
 
-function transposeLinePreservingSpacing(line: string, steps: number) {
-    if (steps === 0) return line;
+function transposeLinePreservingSpacing(line: string, steps: number, preferFlats?: boolean) {
+    if (steps === 0 && !preferFlats) return line;
     let result = "";
     let regex = new RegExp(chordPattern);
     let match;
@@ -62,14 +246,12 @@ function transposeLinePreservingSpacing(line: string, steps: number) {
 
     while ((match = regex.exec(line)) !== null) {
         let original = match[0];
-        // Check that the character immediately after the match is NOT a letter/digit
-        // This prevents matching "F" inside "Faz" or "G" inside "Go" etc.
         const charAfter = line[match.index + original.length];
         const isPartOfWord = charAfter !== undefined && /[a-zA-Záéíóúàãõâêôüç]/.test(charAfter);
         if (isChordToken(original) && !isPartOfWord) {
             let start = match.index;
             result += line.substring(lastIndex, start);
-            let transposed = transposeChord(original, steps);
+            let transposed = transposeChord(original, steps, preferFlats);
             result += transposed;
             
             let lengthDiff = transposed.length - original.length;
@@ -116,9 +298,9 @@ function cleanYoutubeTitle(title: string) {
 
 export type MusicQueryOptions = {
     fontFamily?: string;
-    transposeBy?: number; 
+    transposeBy?: number;
     pageSize?: 'DESKTOP' | 'MOBILE';
-    formats?: string[]; // e.g., ['docx', 'pdf']
+    formats?: string[];
     removeTabs?: boolean;
     simplified?: boolean;
     colors?: {
@@ -128,7 +310,13 @@ export type MusicQueryOptions = {
         preChorus: string;
         bridge: string;
         chords: string;
-    }
+    };
+    darkMode?: boolean;
+    capoPosition?: number;
+    enharmonicPreference?: 'auto' | 'sharp' | 'flat';
+    detectOnly?: boolean;
+    targetKey?: string;
+    targetIsMinor?: boolean;
 };
 
 async function fetchWithTimeout(url: string, options: any = {}, timeout = 25000) {
@@ -157,13 +345,21 @@ function isTabLine(line: string) {
 
 
 export async function processMusicQuery(query: string, options?: MusicQueryOptions) {
+  const detectOnly = options?.detectOnly || false;
+  let transposeByVal = options?.transposeBy || 0;
+
   const opts = {
       fontFamily: options?.fontFamily || 'Courier New',
-      transposeBy: options?.transposeBy || 0,
+      transposeBy: transposeByVal,
       pageSize: options?.pageSize || 'DESKTOP',
       formats: options?.formats || ['docx', 'pdf'],
       removeTabs: options?.removeTabs || false,
       simplified: options?.simplified || false,
+      darkMode: options?.darkMode || false,
+      capoPosition: options?.capoPosition || 0,
+      enharmonicPreference: options?.enharmonicPreference || 'auto',
+      targetKey: options?.targetKey || '',
+      targetIsMinor: options?.targetIsMinor || false,
       colors: {
          title: (options?.colors?.title || '#2B6CB0').replace('#', ''),
          lyrics: (options?.colors?.lyrics || '#000000').replace('#', ''),
@@ -173,6 +369,26 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
          chords: (options?.colors?.chords || '#000000').replace('#', ''),
       }
   };
+
+  function ensureBrightness(hexColor: string, fallback: string): string {
+      const h = hexColor.replace('#', '');
+      const r = parseInt(h.substring(0, 2), 16);
+      const g = parseInt(h.substring(2, 4), 16);
+      const b = parseInt(h.substring(4, 6), 16);
+      const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+      return luminance < 128 ? fallback : h;
+  }
+
+  if (opts.darkMode) {
+      opts.colors = {
+          title: ensureBrightness(opts.colors.title, '64B5F6'),
+          chords: ensureBrightness(opts.colors.chords, 'FFFFFF'),
+          lyrics: ensureBrightness(opts.colors.lyrics, 'E0E0E0'),
+          chorus: ensureBrightness(opts.colors.chorus, 'FF6B6B'),
+          preChorus: ensureBrightness(opts.colors.preChorus, 'FFD54F'),
+          bridge: ensureBrightness(opts.colors.bridge, 'CE93D8'),
+      };
+  }
 
   try {
     let searchTerm = query.trim();
@@ -389,29 +605,133 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
     const songName = $cifra('h1').first().text().trim() || searchTerm;
     const artistName = $cifra('.t3').text().trim() || $cifra('h2').first().text().trim() || 'Artista Desconhecido';
 
+    // --- DETECT CAPO FROM ORIGINAL CIFRA PAGE ---
+    // CifraClub stores capo in JS data: `capo: 7,` or sometimes as text "capo na 5ª casa"
+    let originalCapo = 0;
+    let originalKeyFromPage = '';
+    const pageText = $cifra('body').text();
+    // Try extracting capo from JS data format first (new CifraClub Next.js)
+    const capoJsMatch = pageText.match(/capo:\s*(\d+)/i);
+    if (capoJsMatch) {
+        originalCapo = parseInt(capoJsMatch[1], 10);
+        console.log(`[Cifrador] Capo detectado na cifra original (JS data): ${originalCapo}ª casa`);
+    } else {
+        // Fallback to Portuguese text format (older CifraClub or other sites)
+        const capoTextMatch = pageText.match(/capo\s+na\s+(\d+)[ªa]?\s*(casa|traste)?/i)
+                       || pageText.match(/capotraste\s+na\s+(\d+)[ªa]?\s*(casa|traste)?/i);
+        if (capoTextMatch) {
+            originalCapo = parseInt(capoTextMatch[1], 10);
+            console.log(`[Cifrador] Capo detectado na cifra original (texto): ${originalCapo}ª casa`);
+        }
+    }
+    // Extract original key hint from CifraClub JS data (like `key: 'C'`)
+    const keyJsMatch = pageText.match(/key:\s*'([A-G][#b]?)'/);
+    if (keyJsMatch) {
+        originalKeyFromPage = keyJsMatch[1];
+        console.log(`[Cifrador] Tom informado na página original: ${originalKeyFromPage}`);
+    }
+
     let rawLines = rawCipher.split('\n');
-    
+
     let pageWidthMM = opts.pageSize === 'MOBILE' ? 100 : 210;
-    
-    // Exact margins calculation
+
     let marginTopMM = 5;
     let marginBottomMM = 10;
     let marginLeftMM = 5;
     let marginRightMM = 10;
-    
+
     let printableWidthMM = pageWidthMM - marginLeftMM - marginRightMM;
-    let printableWidthPt = printableWidthMM * 2.83465; 
-    
-    // Process lengths
+    let printableWidthPt = printableWidthMM * 2.83465;
+
+    // --- ENHARMONIC DETECTION + KEY DETECTION ---
+    const chordRoots: string[] = [];
+    const allChordTokens: string[] = [];
+    let firstChord = '';
+    let lastChord = '';
+    for (const line of rawLines) {
+        if (!isChordLine(line)) continue;
+        const tokens = line.split(/[\s\t]+/).filter(Boolean);
+        for (const t of tokens) {
+            const m = t.match(/^([A-G][#b]?)/);
+            if (m) {
+                chordRoots.push(m[1]);
+                allChordTokens.push(t);
+                if (!firstChord) firstChord = t;
+                lastChord = t;
+            }
+        }
+    }
+
+    const keyResult = detectKeyFromChordTokens(allChordTokens, firstChord, lastChord);
+    const shapeRoot = keyResult.root;
+    const shapeIsMinor = keyResult.isMinor;
+    const detectedConfidence = keyResult.confidence;
+    const shapeLabel = shapeRoot + (shapeIsMinor ? 'm' : '');
+    const keyCandidates = keyResult.candidates;
+
+    // When original capo > 0, the detected key is the SHAPE key.
+    // The REAL key = shape key + originalCapo semitones.
+    const originalCapoAdjust = originalCapo > 0 ? originalCapo : 0;
+    const shapeIdx = noteIndex(shapeRoot);
+    const realIdx = shapeIdx !== -1 && originalCapo > 0 ? (shapeIdx + originalCapo) % 12 : shapeIdx;
+    const detectedRoot = realIdx !== -1 ? resolveEnharmonic(realIdx, detectKeyPreference(chordRoots)) : shapeRoot;
+    const detectedIsMinor = shapeIsMinor;
+    const detectedLabel = detectedRoot + (detectedIsMinor ? 'm' : '');
+    const detectedDegrees = keyDegrees(detectedRoot, detectedIsMinor);
+
+    console.log(`[Cifrador] Shape key: ${shapeLabel}${originalCapo > 0 ? ` | Real key: ${detectedLabel} (capo ${originalCapo})` : ''}`);
+
+    // Auto-set transpose when target key is provided
+    if (opts.targetKey) {
+        const targetIdx = noteIndex(opts.targetKey);
+        const detectedIdx = noteIndex(detectedRoot);
+        if (targetIdx !== -1 && detectedIdx !== -1) {
+            const autoTranspose = (targetIdx - detectedIdx + 12) % 12;
+            opts.transposeBy = autoTranspose;
+            transposeByVal = autoTranspose;
+        }
+    }
+
+    // If detectOnly, return key info without generating files
+    if (detectOnly) {
+        console.log(`[Cifrador] Detecção de tom: ${detectedLabel} (confiança: ${Math.round(detectedConfidence * 100)}%)` +
+            (originalCapo > 0 ? ` | Shape: ${shapeLabel} | Capo original: ${originalCapo}ª casa` : ''));
+        return {
+            success: true,
+            detectOnly: true,
+            detectedKey: detectedRoot,
+            detectedIsMinor,
+            detectedLabel,
+            confidence: detectedConfidence,
+            degrees: detectedDegrees,
+            candidates: keyCandidates,
+            filename: `${artistName} - ${songName}`,
+            previewText: rawLines.join('\n'),
+            originalCapo,
+            shapeKey: shapeRoot,
+            shapeIsMinor,
+            shapeLabel,
+        } as any;
+    }
+
+    const preferFlats = opts.enharmonicPreference === 'flat' ? true
+                      : opts.enharmonicPreference === 'sharp' ? false
+                      : detectKeyPreference(chordRoots);
+
+    // --- CAPO + TRANSPOSE ---
+    // originalCapo already defines originalCapoAdjust at line ~687
+    const effectiveSteps = opts.transposeBy - opts.capoPosition + originalCapoAdjust;
+
+    // --- PROCESS LINES ---
     let maxLineLength = 0;
     const processedLines = rawLines.map(line => {
         const isChord = isChordLine(line);
-        // Only transpose actual chord lines — lyric lines must never be modified
-        // This prevents words like "E", "Am", "Belo" in lyrics from being transposed
-        let transposed = isChord ? transposeLinePreservingSpacing(line, opts.transposeBy) : line;
+        let transposed = isChord ? transposeLinePreservingSpacing(line, effectiveSteps, preferFlats) : line;
         if (transposed.length > maxLineLength) maxLineLength = transposed.length;
         return { original: line, text: transposed, isChord };
     });
+
+    const previewText = processedLines.map(pl => pl.text).join('\n');
 
     let requiredFontSizePt = printableWidthPt / (Math.max(maxLineLength, 1) * 0.65);
     let finalFontSizePt = Math.min(14, Math.max(6, requiredFontSizePt));
@@ -513,7 +833,8 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
                         left: convertMillimetersToTwip(marginLeftMM),
                         right: convertMillimetersToTwip(marginRightMM)
                     }
-                } 
+                },
+                ...(opts.darkMode ? { background: { color: "000000" } } : {})
             },
             children: [
               new Paragraph({
@@ -567,7 +888,10 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
 
         // Note: PDF coordinates: 0,0 is bottom-left, y goes UP.
         let page = pdfDoc.addPage([pWidth, pHeight]);
-        let currentY = pHeight - mTop - 16; // Start from top, adjusted for text height
+        if (opts.darkMode) {
+            page.drawRectangle({ x: 0, y: 0, width: pWidth, height: pHeight, color: rgb(0, 0, 0) });
+        }
+        let currentY = pHeight - mTop - 16;
 
         page.drawText(songName, { x: mLeft, y: currentY, size: 16, font: helveticaBold, color: hexToRgbPdf(opts.colors.title) });
         currentY -= 20;
@@ -579,6 +903,9 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
         structuredParagraphs.forEach(pRuns => {
             if (currentY < mBot + lineHeight) {
                 page = pdfDoc.addPage([pWidth, pHeight]);
+                if (opts.darkMode) {
+                    page.drawRectangle({ x: 0, y: 0, width: pWidth, height: pHeight, color: rgb(0, 0, 0) });
+                }
                 currentY = pHeight - mTop - finalFontSizePt;
             }
 
@@ -636,11 +963,32 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
 
     const finalFilename = `${artistName} - ${songName}`;
     console.log(`[Cifrador] Sucesso: ${finalFilename}`);
+    const detectedIdx = noteIndex(detectedRoot);
+    const capoReport = (opts.capoPosition > 0 || originalCapo > 0) ? {
+        userCapo: opts.capoPosition || 0,
+        originalCapo: originalCapo || 0,
+        realKey: resolveEnharmonic((detectedIdx + opts.transposeBy + 12) % 12, preferFlats) + (detectedIsMinor ? 'm' : ''),
+        shapeKey: resolveEnharmonic((detectedIdx + effectiveSteps + 12) % 12, preferFlats) + (detectedIsMinor ? 'm' : ''),
+    } : undefined;
+
     return {
       success: true,
       data: docxBase64,
       pdfData: pdfBase64,
-      filename: finalFilename
+      filename: finalFilename,
+      previewText,
+      capoReport,
+      preferFlats,
+      detectedKey: detectedRoot,
+      detectedIsMinor,
+      detectedLabel,
+      confidence: detectedConfidence,
+      degrees: detectedDegrees,
+      candidates: keyCandidates,
+      originalCapo,
+      shapeKey: shapeRoot,
+      shapeIsMinor,
+      shapeLabel,
     };
 
   } catch (error: any) {
