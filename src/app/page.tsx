@@ -153,23 +153,29 @@ export default function Home() {
     setError('');
     setDetectedKey(null);
     setTargetKey('');
+    // Normalize enharmonic: flats → sharps for keys that the UI buttons use
+    const normalizeNote = (note: string) => {
+      const map: Record<string, string> = { 'Db': 'C#', 'Eb': 'D#', 'Gb': 'F#', 'Ab': 'G#' };
+      return map[note] || note;
+    };
     try {
       const res = await processMusicQuery(query, { detectOnly: true } as any);
       if (res.success && (res as any).detectedKey) {
+        const root = normalizeNote((res as any).detectedKey);
         const info = {
-          root: (res as any).detectedKey,
+          root,
           isMinor: (res as any).detectedIsMinor,
-          label: (res as any).detectedLabel,
+          label: root + ((res as any).detectedIsMinor ? 'm' : ''),
           confidence: (res as any).confidence,
           degrees: (res as any).degrees,
           candidates: (res as any).candidates,
           originalCapo: (res as any).originalCapo || 0,
-          shapeKey: (res as any).shapeKey,
+          shapeKey: normalizeNote((res as any).shapeKey || ''),
           shapeIsMinor: (res as any).shapeIsMinor,
-          shapeLabel: (res as any).shapeLabel,
+          shapeLabel: (res as any).shapeLabel?.replace(/^[A-G][#b]?/, (m: string) => normalizeNote(m)),
         };
         setDetectedKey(info);
-        setTargetKey(info.root);
+        setTargetKey(root);
       } else {
         setError((res as any).error || 'Não foi possível detectar o tom.');
       }
