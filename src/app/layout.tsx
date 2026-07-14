@@ -1,11 +1,6 @@
 import type { Metadata } from 'next';
-import { Outfit, Inter } from 'next/font/google';
+import { Inter } from 'next/font/google';
 import './globals.css';
-
-const outfit = Outfit({
-  variable: '--font-outfit',
-  subsets: ['latin'],
-});
 
 const inter = Inter({
   variable: '--font-inter',
@@ -13,8 +8,8 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: 'Cifrador 1.0.0',
-  description: 'Gerador automático de Cifras e Partituras em DOCX originadas do YouTube ou texto.',
+  title: 'Cifrador',
+  description: 'Busque cifras no CifraClub e exporte em DOCX ou PDF.',
 };
 
 export default function RootLayout({
@@ -24,7 +19,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="pt-BR">
-      <body className={`${inter.variable} ${outfit.variable} font-sans antialiased text-white bg-black`}>
+      <body className={`${inter.variable} font-sans antialiased`}>
         {children}
       </body>
     </html>

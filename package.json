@@ -1,6 +1,6 @@
 {
   "name": "cifrador",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "cheerio": "^1.2.0",
-    "chordsheetjs": "^14.2.1",
     "docx": "^9.6.1",
     "framer-motion": "^12.38.0",
     "lucide-react": "^1.7.0",

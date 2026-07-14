@@ -1,7 +1,32 @@
 'use server';
 
 import * as cheerio from 'cheerio';
-import { Document, Packer, Paragraph, TextRun, convertMillimetersToTwip } from 'docx';
+import { Document, Packer, Paragraph, TextRun, convertMillimetersToTwip, HighlightColor } from 'docx';
+import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+
+// -- CONSTANTS --
+const CHART_WIDTH_RATIO = 0.65;
+const LINE_HEIGHT_RATIO = 1.25;
+const MM_TO_PT = 2.83465;
+const LUMINANCE_THRESHOLD = 128;
+const MAX_INPUT_LENGTH = 200;
+const KEY_CONFIDENCE_MAX = 8;
+const KEY_CONFIDENCE_PER_CHORD = 0.3;
+const TONIC_MATCH_WEIGHT = 3;
+const TONIC_PARTIAL_WEIGHT = 1.5;
+const DOMINANT_WEIGHT = 2;
+const SUBDOMINANT_WEIGHT = 1.5;
+const RELATIVE_WEIGHT = 0.8;
+const BVI_WEIGHT = 0.6;
+const VI_MINOR_WEIGHT = 0.5;
+const IN_SCALE_WEIGHT = 0.3;
+const OUT_OF_KEY_PENALTY = 0.8;
+const FIRST_CHORD_BONUS = 0.3;
+const FIRST_CHORD_DOMINANT_BONUS = 0.15;
+const LAST_CHORD_BONUS = 0.6;
+const MOST_FREQUENT_TONIC_BONUS = 1.5;
+const TONIC_DOMINANT_PAIR_BONUS = 1.0;
+const TONIC_SUBDOMINANT_PAIR_BONUS = 0.7;
 
 // -- HARMONIC ENGINE --
 const scale = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -24,11 +49,12 @@ function detectKeyPreference(roots: string[]): boolean {
     if (roots.length === 0) return false;
     let flatScore = 0;
     let sharpScore = 0;
+    const sharpPreferredIndices = new Set([0, 2, 4, 7, 9, 11]); // C, D, E, G, A, B
     for (const root of roots) {
         const idx = noteIndex(root);
         if (idx === -1) continue;
         if (flatKeys.has(idx)) flatScore++;
-        else if (!idx || idx === 2 || idx === 4 || idx === 7 || idx === 9 || idx === 11) sharpScore++;
+        else if (sharpPreferredIndices.has(idx)) sharpScore++;
     }
     return flatScore > sharpScore;
 }
@@ -54,28 +80,16 @@ function transposeChord(chordText: string, steps: number, preferFlats?: boolean)
     return transposeNote(match[1], steps, preferFlats) + match[2];
 }
 
-// Capo math: C = (T - S + 12) % 12  → find capo from real key & shape
-//             T = (S + C) % 12       → find real key from shape & capo
-function capoTranspose(rootIndex: number, capoPosition: number): number {
-    return ((rootIndex - capoPosition) % 12 + 12) % 12;
-}
-
-function capoInfo(originalRoots: number[], capoPosition: number) {
-    const realKey = originalRoots[0];
-    const shapeKey = capoTranspose(realKey, capoPosition);
-    return { realKey, shapeKey, capoPosition };
-}
-
 const scaleDegrees = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII'];
 
-function keyDegrees(keyRoot: string, isMinor: boolean): string[] {
+function keyDegrees(keyRoot: string, isMinor: boolean, preferFlats?: boolean): string[] {
     const idx = noteIndex(keyRoot);
     if (idx === -1) return scaleDegrees;
     if (isMinor) {
         // Natural minor: i ii° III iv v VI VII
         const intervals = [0, 2, 3, 5, 7, 8, 10];
         return intervals.map(iv => {
-            const note = resolveEnharmonic((idx + iv) % 12, false);
+            const note = resolveEnharmonic((idx + iv) % 12, preferFlats ?? false);
             const deg = scaleDegrees[iv];
             if (iv === 0) return note + 'm (' + deg.toLowerCase() + ')';
             if (iv === 2) return note + ' (' + deg + ')';
@@ -89,8 +103,7 @@ function keyDegrees(keyRoot: string, isMinor: boolean): string[] {
     // Major: I ii iii IV V vi vii°
     const intervals = [0, 2, 4, 5, 7, 9, 11];
     return intervals.map(iv => {
-        const note = resolveEnharmonic((idx + iv) % 12, false);
-        const deg = scaleDegrees[iv];
+        const note = resolveEnharmonic((idx + iv) % 12, preferFlats ?? false);
         if (iv === 0) return note + ' (I)';
         if (iv === 1) return note + 'm (ii)';
         if (iv === 2) return note + 'm (iii)';
@@ -122,6 +135,12 @@ function detectKeyFromChordTokens(tokens: string[], firstChord?: string, lastCho
         if (quality.startsWith('m') && !quality.startsWith('M')) {
             rootMinorFreq[root] = (rootMinorFreq[root] || 0) + 1;
         }
+        // Also count bass note from slash chords (e.g., C/E → E is also present)
+        const bassMatch = t.match(/\/([A-G][#b]?)$/);
+        if (bassMatch) {
+            const bassRoot = bassMatch[1];
+            rootFreq[bassRoot] = (rootFreq[bassRoot] || 0) + 1;
+        }
         if (i === 0) firstRoot = root;
         lastRoot = root;
     }
@@ -151,41 +170,64 @@ function detectKeyFromChordTokens(tokens: string[], firstChord?: string, lastCho
                 if (rootIdx === keyIdx) {
                     // Tonic match
                     const isTonicMinor = (rootMinorFreq[root] || 0) > count / 2;
-                    if (isMinor === isTonicMinor) score += 3 * weight;
-                    else score += 1.5 * weight;
+                    if (isMinor === isTonicMinor) score += TONIC_MATCH_WEIGHT * weight;
+                    else score += TONIC_PARTIAL_WEIGHT * weight;
                 } else if (rootIdx === (keyIdx + 7) % 12) {
                     // Dominant (V) — very strong indicator
-                    score += 2 * weight;
+                    score += DOMINANT_WEIGHT * weight;
                 } else if (rootIdx === (keyIdx + 5) % 12) {
                     // Subdominant (IV)
-                    score += 1.5 * weight;
+                    score += SUBDOMINANT_WEIGHT * weight;
                 } else if (rootIdx === (keyIdx + 3) % 12) {
                     // Relative minor/major
-                    score += 0.8 * weight;
+                    score += RELATIVE_WEIGHT * weight;
                 } else if (isMinor && rootIdx === (keyIdx + 10) % 12) {
                     // bVII in minor — common in rock/pop
-                    score += 0.6 * weight;
+                    score += BVI_WEIGHT * weight;
                 } else if (isMinor && rootIdx === (keyIdx + 8) % 12) {
                     // VI in minor
-                    score += 0.5 * weight;
+                    score += VI_MINOR_WEIGHT * weight;
                 } else if (scaleNotes.includes(rootIdx)) {
-                    score += 0.3 * weight;
+                    score += IN_SCALE_WEIGHT * weight;
                 } else {
-                    score -= 0.5 * weight; // Penalty for out-of-key roots
+                    score -= OUT_OF_KEY_PENALTY * weight; // Penalty for out-of-key roots
                 }
             }
 
             // Bonus for first chord matching tonic
             if (firstRoot) {
                 const fIdx = noteIndex(firstRoot);
-                if (fIdx === keyIdx) score += 1.2;
-                else if (fIdx === (keyIdx + 7) % 12) score += 0.5;
+                if (fIdx === keyIdx) score += FIRST_CHORD_BONUS;
+                else if (fIdx === (keyIdx + 7) % 12) score += FIRST_CHORD_DOMINANT_BONUS;
             }
             // Bonus for last chord matching tonic
             if (lastRoot) {
                 const lIdx = noteIndex(lastRoot);
-                if (lIdx === keyIdx) score += 0.8;
+                if (lIdx === keyIdx) score += LAST_CHORD_BONUS;
             }
+
+            // Bonus: most frequent chord in the song is the tonic
+            let maxFreq = 0;
+            let mostFrequentRoot = '';
+            for (const [root, count] of Object.entries(rootFreq)) {
+                if (count > maxFreq) {
+                    maxFreq = count;
+                    mostFrequentRoot = root;
+                }
+            }
+            if (mostFrequentRoot) {
+                const mfIdx = noteIndex(mostFrequentRoot);
+                if (mfIdx === keyIdx) {
+                    score += MOST_FREQUENT_TONIC_BONUS;
+                }
+            }
+
+            // Bonus: tonic-dominant pair (I and V both present as major chords)
+            const hasTonic = rootFreq[resolveEnharmonic(keyIdx, false)] > 0;
+            const hasDominant = rootFreq[resolveEnharmonic((keyIdx + 7) % 12, false)] > 0;
+            const hasSubdominant = rootFreq[resolveEnharmonic((keyIdx + 5) % 12, false)] > 0;
+            if (hasTonic && hasDominant) score += TONIC_DOMINANT_PAIR_BONUS;
+            if (hasTonic && hasSubdominant) score += TONIC_SUBDOMINANT_PAIR_BONUS;
 
             candidates.push({ root: keyRoot, isMinor, score: Math.round(score * 100) / 100 });
         }
@@ -196,7 +238,7 @@ function detectKeyFromChordTokens(tokens: string[], firstChord?: string, lastCho
     const runnerUp = candidates[1];
 
     // Normalize confidence
-    const maxPossible = Math.min(8, 3 + totalCount * 0.3);
+    const maxPossible = Math.min(KEY_CONFIDENCE_MAX, TONIC_MATCH_WEIGHT + totalCount * KEY_CONFIDENCE_PER_CHORD);
     const rawConfidence = best.score / maxPossible;
     const confidence = Math.min(1, Math.max(0.1, rawConfidence));
 
@@ -220,36 +262,36 @@ function isChordToken(token: string) {
 }
 
 function isChordLine(line: string) {
-    let tokens = line.split(/[\s\t]+/).filter(Boolean);
+    const tokens = line.split(/[\s\t]+/).filter(Boolean);
     if (tokens.length === 0) return false;
     
     // Ignore lines that are clearly tab headers or contain mostly dashes
     if (line.includes('|') || line.includes('---')) return false;
     if (line.toLowerCase().includes('[tab')) return false;
 
-    let chordTokens = tokens.filter(isChordToken);
+    const chordTokens = tokens.filter(isChordToken);
     if (chordTokens.length === 0) return false;
 
-    let isMostlyChords = chordTokens.length / tokens.length > 0.5;
-    let containsLowerCase = /[a-z]{3,}/.test(line.replace(/\[.*?\]/g, '')); 
+    const isMostlyChords = chordTokens.length / tokens.length > 0.5;
+    const containsLowerCase = /[a-z]{3,}/.test(line.replace(/\[.*?\]/g, '')); 
     return isMostlyChords && !containsLowerCase;
 }
 
 function transposeLinePreservingSpacing(line: string, steps: number, preferFlats?: boolean) {
     if (steps === 0 && !preferFlats) return line;
     let result = "";
-    let regex = new RegExp(chordPattern);
+    const regex = new RegExp(chordPattern);
     let match;
     let lastIndex = 0;
 
     while ((match = regex.exec(line)) !== null) {
-        let original = match[0];
+        const original = match[0];
         const charAfter = line[match.index + original.length];
         const isPartOfWord = charAfter !== undefined && /[a-zA-Záéíóúàãõâêôüç]/.test(charAfter);
         if (isChordToken(original) && !isPartOfWord) {
-            let start = match.index;
+            const start = match.index;
             result += line.substring(lastIndex, start);
-            let transposed = transposeChord(original, steps, preferFlats);
+            const transposed = transposeChord(original, steps, preferFlats);
             result += transposed;
             
             let lengthDiff = transposed.length - original.length;
@@ -291,7 +333,8 @@ function cleanYoutubeTitle(title: string) {
   for (const term of termsToRemove) {
     title = title.replace(new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '');
   }
-  return title.replace(/[|:;\\\/_-]/g, ' ').replace(/\s+/g, ' ').trim();
+  // Only remove leading/trailing separators and pipes/semicolons, preserve internal hyphens and underscores
+  return title.replace(/^[|:;\s\\]+|[|:;\s\\]+$/g, '').replace(/\s+/g, ' ').trim();
 }
 
 export type MusicQueryOptions = {
@@ -317,7 +360,34 @@ export type MusicQueryOptions = {
     targetIsMinor?: boolean;
 };
 
-async function fetchWithTimeout(url: string, options: any = {}, timeout = 25000) {
+export type RunData = { text: string; color: string; bold: boolean; isHighlight?: boolean; isChord?: boolean };
+
+type BulkSongResult = {
+    filename: string;
+    previewText: string;
+    detectedLabel: string;
+    confidence: number;
+    structuredParagraphs: RunData[][];
+    finalFontSizePt: number;
+    finalFontSizeHalfPt: number;
+    songName: string;
+    artistName: string;
+    error?: string;
+};
+
+export type BulkMusicQueryResult = {
+    success: true;
+    data: string | null;
+    pdfData: string | null;
+    songs: BulkSongResult[];
+} | {
+    success: false;
+    error: string;
+};
+
+type SolrDoc = { tipo: string; dns?: string; url?: string; txt?: string; art?: string };
+
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout = 25000) {
   console.log(`[Cifrador] Fetching: ${url} (timeout: ${timeout}ms)`);
   const controller = new AbortController();
   const id = setTimeout(() => {
@@ -338,11 +408,66 @@ function isTabLine(line: string) {
     const dashCount = (line.match(/-/g) || []).length;
     const barCount = (line.match(/\|/g) || []).length;
     const guitarNotation = (line.match(/^[abcdefg][#b]?\s*\|/i) || []).length;
-    return (dashCount > 6) || (barCount > 2 && dashCount > 2) || (guitarNotation >= 1);
+    // Require a higher threshold of dashes to avoid false positives on lyrics with hyphens
+    const isDashHeavy = dashCount > 8 && dashCount / Math.max(line.length, 1) > 0.15;
+    const isBarHeavy = barCount > 3 && dashCount > 3;
+    return isDashHeavy || isBarHeavy || (guitarNotation >= 1);
+}
+
+function ensureBrightness(hexColor: string, fallback: string): string {
+    const h = hexColor.replace('#', '');
+    const r = parseInt(h.substring(0, 2), 16);
+    const g = parseInt(h.substring(2, 4), 16);
+    const b = parseInt(h.substring(4, 6), 16);
+    const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+    return luminance < LUMINANCE_THRESHOLD ? fallback : h;
 }
 
 
-export async function processMusicQuery(query: string, options?: MusicQueryOptions) {
+export type ProcessMusicQueryResult = {
+    success: true;
+    data: string | null;
+    pdfData: string | null;
+    filename: string;
+    previewText: string;
+    capoReport?: { userCapo: number; originalCapo: number; realKey: string; shapeKey: string };
+    preferFlats: boolean;
+    detectedKey: string;
+    detectedIsMinor: boolean;
+    detectedLabel: string;
+    confidence: number;
+    degrees: string[];
+    candidates: { root: string; isMinor: boolean; score: number }[];
+    originalCapo: number;
+    shapeKey: string;
+    shapeIsMinor: boolean;
+    shapeLabel: string;
+    structuredParagraphs?: RunData[][];
+    finalFontSizePt?: number;
+    finalFontSizeHalfPt?: number;
+    songName?: string;
+    artistName?: string;
+} | {
+    success: false;
+    error: string;
+} | {
+    success: true;
+    detectOnly: true;
+    detectedKey: string;
+    detectedIsMinor: boolean;
+    detectedLabel: string;
+    confidence: number;
+    degrees: string[];
+    candidates: { root: string; isMinor: boolean; score: number }[];
+    filename: string;
+    previewText: string;
+    originalCapo: number;
+    shapeKey: string;
+    shapeIsMinor: boolean;
+    shapeLabel: string;
+};
+
+export async function processMusicQuery(query: string, options?: MusicQueryOptions): Promise<ProcessMusicQueryResult> {
   const detectOnly = options?.detectOnly || false;
   let transposeByVal = options?.transposeBy || 0;
 
@@ -368,15 +493,6 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
       }
   };
 
-  function ensureBrightness(hexColor: string, fallback: string): string {
-      const h = hexColor.replace('#', '');
-      const r = parseInt(h.substring(0, 2), 16);
-      const g = parseInt(h.substring(2, 4), 16);
-      const b = parseInt(h.substring(4, 6), 16);
-      const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-      return luminance < 128 ? fallback : h;
-  }
-
   if (opts.darkMode) {
       opts.colors = {
           title: ensureBrightness(opts.colors.title, '64B5F6'),
@@ -390,6 +506,12 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
 
   try {
     let searchTerm = query.trim();
+    if (!searchTerm) {
+        return { success: false, error: 'Por favor, insira o nome de uma música ou link do YouTube.' };
+    }
+    if (searchTerm.length > MAX_INPUT_LENGTH) {
+        return { success: false, error: `Entrada muito longa (máximo ${MAX_INPUT_LENGTH} caracteres). Tente um nome mais curto.` };
+    }
     console.log(`[Cifrador] Iniciando processamento para: "${searchTerm}"`);
 
     if (searchTerm.includes('youtube.com/') || searchTerm.includes('youtu.be/')) {
@@ -400,7 +522,14 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
       if (!ytRes.ok) throw new Error('Não foi possível acessar o YouTube.');
       const html = await ytRes.text();
       const $ = cheerio.load(html);
-      searchTerm = cleanYoutubeTitle($('title').text() || '');
+      // Try og:title first (more reliable), then <title>, then fallback
+      const ogTitle = $('meta[property="og:title"]').attr('content') || '';
+      const pageTitle = $('title').text() || '';
+      const rawTitle = ogTitle || pageTitle;
+      searchTerm = cleanYoutubeTitle(rawTitle);
+      if (!searchTerm) {
+        throw new Error('Não foi possível extrair o título do vídeo do YouTube. Tente pesquisar pelo nome da música diretamente.');
+      }
       console.log(`[Cifrador] Título extraído do YouTube: "${searchTerm}"`);
     }
     
@@ -437,14 +566,14 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
                 const docs = solrData?.response?.docs || [];
                 
                 // Procura o primeiro resultado do tipo "2" (música) que tenha url
-                const songResult = docs.find((doc: any) => doc.tipo === '2' && doc.dns && doc.url);
+                const songResult = docs.find((doc: SolrDoc) => doc.tipo === '2' && doc.dns && doc.url);
                 
                 if (songResult) {
                     cifraUrl = `https://www.cifraclub.com.br/${songResult.dns}/${songResult.url}/`;
                     console.log(`[Cifrador] Encontrado via API Solr: ${songResult.txt} - ${songResult.art} => ${cifraUrl}`);
                 } else {
                     // Se não encontrou música direta, tenta com resultado de artista
-                    const artistResult = docs.find((doc: any) => doc.tipo === '1' && doc.dns);
+                    const artistResult = docs.find((doc: SolrDoc) => doc.tipo === '1' && doc.dns);
                     if (artistResult) {
                         console.log(`[Cifrador] Artista encontrado: ${artistResult.txt}. Buscando música no perfil...`);
                         // Tenta buscar novamente com query mais específica
@@ -454,7 +583,7 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
                             const retryRes = await fetchWithTimeout(retryUrl, { headers: { 'Accept': 'application/json' } }, 10000);
                             if (retryRes.ok) {
                                 const retryData = await retryRes.json();
-                                const retrySong = retryData?.response?.docs?.find((doc: any) => doc.tipo === '2' && doc.dns && doc.url);
+                                const retrySong = retryData?.response?.docs?.find((doc: SolrDoc) => doc.tipo === '2' && doc.dns && doc.url);
                                 if (retrySong) {
                                     cifraUrl = `https://www.cifraclub.com.br/${retrySong.dns}/${retrySong.url}/`;
                                     console.log(`[Cifrador] Encontrado na retry: ${retrySong.txt} => ${cifraUrl}`);
@@ -466,8 +595,9 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
             } else {
                 console.log(`[Cifrador] API Solr falhou (Status: ${solrRes.status})`);
             }
-        } catch (solrErr: any) {
-            console.log(`[Cifrador] Erro na API Solr: ${solrErr.message}. Tentando fallback...`);
+        } catch (solrErr: unknown) {
+            const msg = solrErr instanceof Error ? solrErr.message : String(solrErr);
+            console.log(`[Cifrador] Erro na API Solr: ${msg}. Tentando fallback...`);
         }
 
         // Fallback: busca via Google (mais resiliente que DuckDuckGo/Bing em serverless)
@@ -496,12 +626,13 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
                                     cifraUrl = urlObj.origin + urlObj.pathname;
                                     return false;
                                 }
-                            } catch (e) { /* ignore */ }
+                            } catch { /* ignore invalid URLs */ }
                         }
                     });
                 }
-            } catch (googleErr: any) {
-                console.log(`[Cifrador] Google fallback falhou: ${googleErr.message}`);
+            } catch (googleErr: unknown) {
+                const msg = googleErr instanceof Error ? googleErr.message : String(googleErr);
+                console.log(`[Cifrador] Google fallback falhou: ${msg}`);
             }
         }
     }
@@ -559,10 +690,10 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
     // Limpeza profunda de tablaturas para simular o efeito do link #tabs=false
     if (opts.removeTabs) {
         console.log(`[Cifrador] Iniciando limpeza profunda de tablaturas...`);
-        let lines = rawCipher.split('\n');
+        const lines = rawCipher.split('\n');
         
         // 1. Limpeza cirúrgica de rótulos de Tab em linhas de acordes
-        let cleanedLines = lines.map(line => {
+        const cleanedLines = lines.map(line => {
             let l = line;
             // Remove "[Tab - Intro]", "[Tab]", etc, mas mantém os acordes vizinhos
             l = l.replace(/\[\s*tab.*?\s*\]/gi, '');
@@ -608,15 +739,16 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
     let originalCapo = 0;
     let originalKeyFromPage = '';
     const pageText = $cifra('body').text();
-    // Try extracting capo from JS data format first (new CifraClub Next.js)
-    const capoJsMatch = pageText.match(/capo:\s*(\d+)/i);
+    // Try extracting capo from JS data format first (newer CifraClub)
+    const capoJsMatch = pageText.match(/capo(?:Position)?:\s*(\d+)/i);
     if (capoJsMatch) {
         originalCapo = parseInt(capoJsMatch[1], 10);
         console.log(`[Cifrador] Capo detectado na cifra original (JS data): ${originalCapo}ª casa`);
     } else {
         // Fallback to Portuguese text format (older CifraClub or other sites)
-        const capoTextMatch = pageText.match(/capo\s+na\s+(\d+)[ªa]?\s*(casa|traste)?/i)
-                       || pageText.match(/capotraste\s+na\s+(\d+)[ªa]?\s*(casa|traste)?/i);
+        const capoTextMatch = pageText.match(/capo\s+(?:na|em)\s+(\d+)[ªa]?\s*(?:casa|traste)?/i)
+                       || pageText.match(/capotraste\s+(?:na|em)\s+(\d+)[ªa]?\s*(?:casa|traste)?/i)
+                       || pageText.match(/cavaquinho\s+.*?(\d+)[ªa]?\s*(?:casa|traste)/i);
         if (capoTextMatch) {
             originalCapo = parseInt(capoTextMatch[1], 10);
             console.log(`[Cifrador] Capo detectado na cifra original (texto): ${originalCapo}ª casa`);
@@ -629,17 +761,17 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
         console.log(`[Cifrador] Tom informado na página original: ${originalKeyFromPage}`);
     }
 
-    let rawLines = rawCipher.split('\n');
+    const rawLines = rawCipher.split('\n');
 
-    let pageWidthMM = opts.pageSize === 'MOBILE' ? 100 : 210;
+    const pageWidthMM = opts.pageSize === 'MOBILE' ? 100 : 210;
 
-    let marginTopMM = 5;
-    let marginBottomMM = 10;
-    let marginLeftMM = 5;
-    let marginRightMM = 10;
+    const marginTopMM = 5;
+    const marginBottomMM = 10;
+    const marginLeftMM = 5;
+    const marginRightMM = 10;
 
-    let printableWidthMM = pageWidthMM - marginLeftMM - marginRightMM;
-    let printableWidthPt = printableWidthMM * 2.83465;
+    const printableWidthMM = pageWidthMM - marginLeftMM - marginRightMM;
+    const printableWidthPt = printableWidthMM * MM_TO_PT;
 
     // --- ENHARMONIC DETECTION + KEY DETECTION ---
     const chordRoots: string[] = [];
@@ -675,7 +807,11 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
     const detectedRoot = realIdx !== -1 ? resolveEnharmonic(realIdx, detectKeyPreference(chordRoots)) : shapeRoot;
     const detectedIsMinor = shapeIsMinor;
     const detectedLabel = detectedRoot + (detectedIsMinor ? 'm' : '');
-    const detectedDegrees = keyDegrees(detectedRoot, detectedIsMinor);
+    const preferFlats = opts.enharmonicPreference === 'flat' ? true
+                      : opts.enharmonicPreference === 'sharp' ? false
+                      : detectKeyPreference(chordRoots);
+
+    const detectedDegrees = keyDegrees(detectedRoot, detectedIsMinor, preferFlats);
 
     console.log(`[Cifrador] Shape key: ${shapeLabel}${originalCapo > 0 ? ` | Real key: ${detectedLabel} (capo ${originalCapo})` : ''}`);
 
@@ -709,12 +845,8 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
             shapeKey: shapeRoot,
             shapeIsMinor,
             shapeLabel,
-        } as any;
+        };
     }
-
-    const preferFlats = opts.enharmonicPreference === 'flat' ? true
-                      : opts.enharmonicPreference === 'sharp' ? false
-                      : detectKeyPreference(chordRoots);
 
     // --- CAPO + TRANSPOSE ---
     // originalCapo already defines originalCapoAdjust at line ~687
@@ -724,22 +856,20 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
     let maxLineLength = 0;
     const processedLines = rawLines.map(line => {
         const isChord = isChordLine(line);
-        let transposed = isChord ? transposeLinePreservingSpacing(line, effectiveSteps, preferFlats) : line;
+        const transposed = isChord ? transposeLinePreservingSpacing(line, effectiveSteps, preferFlats) : line;
         if (transposed.length > maxLineLength) maxLineLength = transposed.length;
         return { original: line, text: transposed, isChord };
     });
 
     const previewText = processedLines.map(pl => pl.text).join('\n');
 
-    let requiredFontSizePt = printableWidthPt / (Math.max(maxLineLength, 1) * 0.65);
-    let finalFontSizePt = Math.min(14, Math.max(6, requiredFontSizePt));
-    let finalFontSizeHalfPt = Math.floor(finalFontSizePt * 2);
+    const requiredFontSizePt = printableWidthPt / (Math.max(maxLineLength, 1) * CHART_WIDTH_RATIO);
+    const finalFontSizePt = Math.min(14, Math.max(6, requiredFontSizePt));
+    const finalFontSizeHalfPt = Math.floor(finalFontSizePt * 2);
 
     // Structure generation
     let sectionColor = opts.colors.lyrics; 
-    let isSoloSection = false;
 
-    type RunData = { text: string; color: string; bold: boolean; isHighlight?: boolean; isChord?: boolean };
     const structuredParagraphs: RunData[][] = [];
 
     processedLines.forEach(lineObj => {
@@ -758,12 +888,12 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
          }
       }
 
-      let blocks = lineObj.text.split(/(\[.*?\])/g);
-      let pRuns: RunData[] = [];
+      const blocks = lineObj.text.split(/(\[.*?\])/g);
+      const pRuns: RunData[] = [];
 
-      for (let block of blocks) {
+      for (const block of blocks) {
           if (!block) continue;
-          let isBracket = block.startsWith('[') && block.endsWith(']');
+          const isBracket = block.startsWith('[') && block.endsWith(']');
           
           let color = sectionColor;
           let bold = false;
@@ -794,15 +924,14 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
            
            return new Paragraph({
               children: pRuns.map(r => {
-                 let props: any = {
+                 return new TextRun({
                     text: r.text,
                     font: opts.fontFamily,
                     size: finalFontSizeHalfPt,
-                    color: r.color,
-                    bold: r.bold
-                 };
-                 if (r.isHighlight) props.highlight = "yellow";
-                 return new TextRun(props);
+                    color: r.isHighlight ? "000000" : r.color,
+                    bold: r.bold,
+                    highlight: r.isHighlight ? HighlightColor.YELLOW : undefined
+                 });
               })
            });
         });
@@ -844,16 +973,15 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
 
     if (opts.formats.includes('pdf')) {
         console.log(`[Cifrador] Gerando PDF...`);
-        const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
         
         function hexToRgbPdf(hexColor: string) {
             let cleanHex = hexColor.replace('#', '');
             if (cleanHex.length === 3) {
                 cleanHex = cleanHex.split('').map(c => c + c).join('');
             }
-            let r = parseInt(cleanHex.substring(0, 2), 16) / 255;
-            let g = parseInt(cleanHex.substring(2, 4), 16) / 255;
-            let b = parseInt(cleanHex.substring(4, 6), 16) / 255;
+            const r = parseInt(cleanHex.substring(0, 2), 16) / 255;
+            const g = parseInt(cleanHex.substring(2, 4), 16) / 255;
+            const b = parseInt(cleanHex.substring(4, 6), 16) / 255;
             return rgb(r, g, b);
         }
 
@@ -866,9 +994,9 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
         const pWidth = opts.pageSize === 'MOBILE' ? 283.46 : 595.28;
         const pHeight = opts.pageSize === 'MOBILE' ? 850.39 : 841.89;
         
-        const mTop = marginTopMM * 2.83465;
-        const mBot = marginBottomMM * 2.83465;
-        const mLeft = marginLeftMM * 2.83465;
+        const mTop = marginTopMM * MM_TO_PT;
+        const mBot = marginBottomMM * MM_TO_PT;
+        const mLeft = marginLeftMM * MM_TO_PT;
 
         // Note: PDF coordinates: 0,0 is bottom-left, y goes UP.
         let page = pdfDoc.addPage([pWidth, pHeight]);
@@ -882,7 +1010,7 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
         page.drawText(artistName, { x: mLeft, y: currentY, size: 12, font: helvetica, color: hexToRgbPdf(opts.colors.title) });
         currentY -= 30;
 
-        let lineHeight = finalFontSizePt * 1.25;
+        const lineHeight = finalFontSizePt * LINE_HEIGHT_RATIO;
 
         structuredParagraphs.forEach(pRuns => {
             if (currentY < mBot + lineHeight) {
@@ -900,14 +1028,14 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
 
             let currentX = mLeft;
           for (let i = 0; i < pRuns.length; i++) {
-               let r = pRuns[i];
-               let textFont = r.bold ? courierBold : courier;
+               const r = pRuns[i];
+               const textFont = r.bold ? courierBold : courier;
                 // PDF-Lib standard fonts support WinAnsi (Portuguese accents)
-                let cleanText = r.text.replace(/\r/g, '')
+                const cleanText = r.text.replace(/\r/g, '')
                                     .replace(/↓/g, 'v')
                                     .replace(/↑/g, '^')
                                     .replace(/[^\x00-\xFF]/g, ' '); // Keep Latin-1 characters (accents), remove others
-               let textWidth = textFont.widthOfTextAtSize(cleanText, finalFontSizePt);
+               const textWidth = textFont.widthOfTextAtSize(cleanText, finalFontSizePt);
                
                let textColor = hexToRgbPdf(r.color);
 
@@ -967,10 +1095,305 @@ export async function processMusicQuery(query: string, options?: MusicQueryOptio
       shapeKey: shapeRoot,
       shapeIsMinor,
       shapeLabel,
+      structuredParagraphs,
+      finalFontSizePt,
+      finalFontSizeHalfPt,
+      songName,
+      artistName,
     };
 
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error(`[Cifrador] ERRO:`, error);
-    return { success: false, error: error.message || 'Ocorreu um erro desconhecido.' };
+    const message = error instanceof Error ? error.message : 'Ocorreu um erro desconhecido.';
+    if (message.includes('timeout') || message.includes('abort')) {
+        return { success: false, error: 'A busca demorou muito. Verifique sua conexão e tente novamente.' };
+    }
+    if (message.includes('fetch')) {
+        return { success: false, error: 'Erro de conexão ao buscar a cifra. Tente novamente em alguns instantes.' };
+    }
+    return { success: false, error: message };
   }
+}
+
+export async function processBulkMusicQuery(
+  queries: string[],
+  options?: MusicQueryOptions
+): Promise<BulkMusicQueryResult> {
+  if (!queries || queries.length === 0) {
+    return { success: false, error: 'Nenhuma música fornecida.' };
+  }
+  if (queries.length > 30) {
+    return { success: false, error: 'Máximo de 30 músicas por vez.' };
+  }
+
+  console.log(`[Cifrador] Processamento em massa: ${queries.length} músicas`);
+
+  const bulkOptions: MusicQueryOptions = {
+    ...options,
+    formats: [],
+  };
+
+  const results = await Promise.all(
+    queries.map((q) => processMusicQuery(q, bulkOptions))
+  );
+
+  const songs: BulkSongResult[] = [];
+  for (let i = 0; i < results.length; i++) {
+    const res = results[i];
+    if (res.success && 'structuredParagraphs' in res && res.structuredParagraphs) {
+      songs.push({
+        filename: res.filename,
+        previewText: res.previewText,
+        detectedLabel: res.detectedLabel,
+        confidence: res.confidence,
+        structuredParagraphs: res.structuredParagraphs,
+        finalFontSizePt: res.finalFontSizePt || 10,
+        finalFontSizeHalfPt: res.finalFontSizeHalfPt || 20,
+        songName: res.songName || queries[i],
+        artistName: res.artistName || 'Artista',
+      });
+    } else {
+      const error = !res.success ? res.error : 'Dados intermediários não disponíveis.';
+      songs.push({
+        filename: queries[i],
+        previewText: '',
+        detectedLabel: '',
+        confidence: 0,
+        structuredParagraphs: [],
+        finalFontSizePt: 10,
+        finalFontSizeHalfPt: 20,
+        songName: queries[i],
+        artistName: '',
+        error,
+      });
+    }
+  }
+
+  const successfulSongs = songs.filter((s) => !s.error);
+  if (successfulSongs.length === 0) {
+    return { success: false, error: 'Nenhuma cifra foi encontrada. Verifique os nomes das músicas.' };
+  }
+
+  const formats = options?.formats || ['docx', 'pdf'];
+  const fontFamily = options?.fontFamily || 'Courier New';
+  const pageSize = options?.pageSize || 'DESKTOP';
+  const darkMode = options?.darkMode || false;
+
+  const colors = {
+    title: (options?.colors?.title || '#2B6CB0').replace('#', ''),
+    lyrics: (options?.colors?.lyrics || '#000000').replace('#', ''),
+    chorus: (options?.colors?.chorus || '#E53E3E').replace('#', ''),
+    preChorus: (options?.colors?.preChorus || '#D69E2E').replace('#', ''),
+    bridge: (options?.colors?.bridge || '#805AD5').replace('#', ''),
+    chords: (options?.colors?.chords || '#000000').replace('#', ''),
+  };
+
+  if (darkMode) {
+    colors.title = ensureBrightness(colors.title, '64B5F6');
+    colors.chords = ensureBrightness(colors.chords, 'FFFFFF');
+    colors.lyrics = ensureBrightness(colors.lyrics, 'E0E0E0');
+    colors.chorus = ensureBrightness(colors.chorus, 'FF6B6B');
+    colors.preChorus = ensureBrightness(colors.preChorus, 'FFD54F');
+    colors.bridge = ensureBrightness(colors.bridge, 'CE93D8');
+  }
+
+  let docxBase64 = null;
+  let pdfBase64 = null;
+
+  if (formats.includes('docx')) {
+    console.log(`[Cifrador] Gerando DOCX em massa...`);
+    const pageWidthMM = pageSize === 'MOBILE' ? 100 : 210;
+    const marginTopMM = 5;
+    const marginBottomMM = 10;
+    const marginLeftMM = 5;
+    const marginRightMM = 10;
+
+    const allChildren: Paragraph[] = [];
+
+    successfulSongs.forEach((song, idx) => {
+      if (idx > 0) {
+        allChildren.push(new Paragraph({ pageBreakBefore: true, children: [] }));
+      }
+      allChildren.push(
+        new Paragraph({
+          children: [new TextRun({ text: song.songName, bold: true, size: 32, font: 'Arial', color: colors.title })],
+        })
+      );
+      allChildren.push(
+        new Paragraph({
+          children: [new TextRun({ text: song.artistName, size: 24, font: 'Arial', color: colors.title })],
+        })
+      );
+      allChildren.push(new Paragraph({ children: [] }));
+
+      const paragraphElements = song.structuredParagraphs.map((pRuns) => {
+        if (pRuns.length === 0) return new Paragraph({ children: [] });
+        return new Paragraph({
+          children: pRuns.map((r) => {
+            return new TextRun({
+              text: r.text,
+              font: fontFamily,
+              size: song.finalFontSizeHalfPt,
+              color: r.isHighlight ? '000000' : r.color,
+              bold: r.bold,
+              highlight: r.isHighlight ? HighlightColor.YELLOW : undefined,
+            });
+          }),
+        });
+      });
+
+      allChildren.push(...paragraphElements);
+    });
+
+    const doc = new Document({
+      creator: 'Cifrador Pro',
+      sections: [
+        {
+          properties: {
+            page: {
+              size: {
+                width: convertMillimetersToTwip(pageWidthMM),
+                height: convertMillimetersToTwip(pageSize === 'MOBILE' ? 300 : 297),
+              },
+              margin: {
+                top: convertMillimetersToTwip(marginTopMM),
+                bottom: convertMillimetersToTwip(marginBottomMM),
+                left: convertMillimetersToTwip(marginLeftMM),
+                right: convertMillimetersToTwip(marginRightMM),
+              },
+            },
+            ...(darkMode ? { background: { color: '000000' } } : {}),
+          },
+          children: allChildren,
+        },
+      ],
+    });
+
+    const buffer = await Packer.toBuffer(doc);
+    docxBase64 = buffer.toString('base64');
+  }
+
+  if (formats.includes('pdf')) {
+    console.log(`[Cifrador] Gerando PDF em massa...`);
+
+    function hexToRgbPdf(hexColor: string) {
+      let cleanHex = hexColor.replace('#', '');
+      if (cleanHex.length === 3) {
+        cleanHex = cleanHex.split('').map((c) => c + c).join('');
+      }
+      const r = parseInt(cleanHex.substring(0, 2), 16) / 255;
+      const g = parseInt(cleanHex.substring(2, 4), 16) / 255;
+      const b = parseInt(cleanHex.substring(4, 6), 16) / 255;
+      return rgb(r, g, b);
+    }
+
+    const pdfDoc = await PDFDocument.create();
+    const helveticaBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+    const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const courier = await pdfDoc.embedFont(StandardFonts.Courier);
+    const courierBold = await pdfDoc.embedFont(StandardFonts.CourierBold);
+
+    const pWidth = pageSize === 'MOBILE' ? 283.46 : 595.28;
+    const pHeight = pageSize === 'MOBILE' ? 850.39 : 841.89;
+    const mTop = 5 * MM_TO_PT;
+    const mBot = 10 * MM_TO_PT;
+    const mLeft = 5 * MM_TO_PT;
+
+    let page = pdfDoc.addPage([pWidth, pHeight]);
+    if (darkMode) {
+      page.drawRectangle({ x: 0, y: 0, width: pWidth, height: pHeight, color: rgb(0, 0, 0) });
+    }
+    let currentY = pHeight - mTop - 16;
+
+    successfulSongs.forEach((song, idx) => {
+      if (idx > 0) {
+        page = pdfDoc.addPage([pWidth, pHeight]);
+        if (darkMode) {
+          page.drawRectangle({ x: 0, y: 0, width: pWidth, height: pHeight, color: rgb(0, 0, 0) });
+        }
+        currentY = pHeight - mTop - 16;
+      }
+
+      page.drawText(song.songName, {
+        x: mLeft,
+        y: currentY,
+        size: 16,
+        font: helveticaBold,
+        color: hexToRgbPdf(colors.title),
+      });
+      currentY -= 20;
+      page.drawText(song.artistName, {
+        x: mLeft,
+        y: currentY,
+        size: 12,
+        font: helvetica,
+        color: hexToRgbPdf(colors.title),
+      });
+      currentY -= 30;
+
+      const lineHeight = song.finalFontSizePt * LINE_HEIGHT_RATIO;
+
+      song.structuredParagraphs.forEach((pRuns) => {
+        if (currentY < mBot + lineHeight) {
+          page = pdfDoc.addPage([pWidth, pHeight]);
+          if (darkMode) {
+            page.drawRectangle({ x: 0, y: 0, width: pWidth, height: pHeight, color: rgb(0, 0, 0) });
+          }
+          currentY = pHeight - mTop - song.finalFontSizePt;
+        }
+
+        if (pRuns.length === 0) {
+          currentY -= lineHeight;
+          return;
+        }
+
+        let currentX = mLeft;
+        for (let i = 0; i < pRuns.length; i++) {
+          const r = pRuns[i];
+          const textFont = r.bold ? courierBold : courier;
+          const cleanText = r.text
+            .replace(/\r/g, '')
+            .replace(/↓/g, 'v')
+            .replace(/↑/g, '^')
+            .replace(/[^\x00-\xFF]/g, ' ');
+          const textWidth = textFont.widthOfTextAtSize(cleanText, song.finalFontSizePt);
+
+          let textColor = hexToRgbPdf(r.color);
+          if (r.isHighlight) {
+            page.drawRectangle({
+              x: currentX,
+              y: currentY - song.finalFontSizePt * 0.2,
+              width: textWidth,
+              height: song.finalFontSizePt * 1.2,
+              color: rgb(1, 1, 0),
+            });
+            textColor = rgb(0, 0, 0);
+          }
+
+          page.drawText(cleanText, {
+            x: currentX,
+            y: currentY,
+            size: song.finalFontSizePt,
+            font: textFont,
+            color: textColor,
+          });
+
+          currentX += textWidth;
+        }
+
+        currentY -= lineHeight;
+      });
+    });
+
+    pdfBase64 = await pdfDoc.saveAsBase64();
+  }
+
+  console.log(`[Cifrador] Massa concluída: ${successfulSongs.length}/${queries.length} músicas`);
+
+  return {
+    success: true,
+    data: docxBase64,
+    pdfData: pdfBase64,
+    songs,
+  };
 }
